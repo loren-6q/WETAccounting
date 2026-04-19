@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WET Ledger - Accounting System</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel for in-browser JSX parsing -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- PDF.js for parsing bank statements -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    
+    <!-- Firebase v9 Compat Libraries for standalone HTML -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        /* Custom scrollbar for webkit */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect } = React;
+
+        // ==========================================
+        // 1. FIREBASE CONFIGURATION (Using Compat Mode)
+        // ==========================================
+        const firebaseConfig = {
+            apiKey: "AIzaSyCGGWOgCb9P6x4fgXw0_iAt1h5C6PcZThc",
+            authDomain: "wetaccounting.firebaseapp.com",
+            projectId: "wetaccounting",
+            storageBucket: "wetaccounting.firebasestorage.app",
+            messagingSenderId: "644990350065",
+            appId: "1:644990350065:web:156e7dd6182fc9ef566f50"
+        };
+
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const appId = 'wet-ledger-final-build';
+
+        // Reference helper for the main ledger collection
+        const getLedgerRef = () => db.collection('artifacts').doc(appId).collection('public').doc('data').collection('ledger');
+
+        // --- AUTO-CATEGORIZATION DICTIONARY ---
+        const AUTO_CAT_RULES = {
+            "100854311": "Booking.com",
+            "100885284": "Stripe / CC",
+            "x379944": "Airbnb",
+            "airbnb": "Airbnb",
+            "salary": "Payroll",
+            "salaries": "Payroll",
+            "maintenance": "Maintenance",
+            "makro": "Supplies",
+            "711": "Food & Beverage",
+            "grab": "Transport",
+            "ais": "Utilities",
+            "pea": "Utilities",
+            "provincialelectricity": "Utilities"
+        };
+
+        const applyAutoCat = (tx) => {
+            const cleanSearchStr = `${tx.desc} ${tx.note || ''} ${tx.chan || ''}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const rawSearchStr = `${tx.desc} ${tx.note || ''} ${tx.chan || ''}`.toLowerCase();
+
+            for (const [k, v] of Object.entries(AUTO_CAT_RULES)) {
+                const cleanKey = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+                if (cleanSearchStr.includes(cleanKey) || rawSearchStr.includes(k.toLowerCase())) {
+                    tx.cat = v;
+                }
+            }
+        };
+
+        // --- ROBUST UTILITIES ---
+        const parseCurrency = (val) => {
+            if (!val) return 0;
+            let s = String(val).trim();
+            const isNegative = s.startsWith('(') && s.endsWith(')') || s.startsWith('-');
+            s = s.replace(/[^0-9.]/g, ''); 
+            let n = parseFloat(s);
+            if (isNegative) n = -Math.abs(n);
+            return isNaN(n) ? 0 : n;
+        };
+
+        const normalizeDate = (s) => {
+            if (!s || typeof s !== 'string') return new Date(0);
+            const parts = s.split(/[\/\s:-]/).filter(Boolean);
+            if (parts.length < 3) return new Date(0);
+            let d = parseInt(parts[0]), m = parseInt(parts[1]) - 1, y = parseInt(parts[2]);
+            if (y > 2400) y -= 543; // Thai Year Correction
+            else if (y < 100) y += 2000;
+            const h = parts[3] ? parseInt(parts[3]) : 0;
+            const min = parts[4] ? parseInt(parts[4]) : 0;
+            return new Date(y, m, d, h, min);
+        };
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [ledger, setLedger] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [syncing, setSyncing] = useState(false);
+            
+            // UI States
+            const [searchTerm, setSearchTerm] = useState('');
+            const [sort, setSort] = useState({ key: 'date', dir: 'desc' });
+            const [statusMsg, setStatusMsg] = useState(null);
+            const [selected, setSelected] = useState(new Set());
+            const [dbStatus, setDbStatus] = useState('connecting');
+            const [activeTab, setActiveTab] = useState('ledger'); // 'ledger' or 'reports'
+            
+            // Filter States
+            const [showFilters, setShowFilters] = useState(false);
+            const [excludedCats, setExcludedCats] = useState(new Set());
+
+            const [editId, setEditId] = useState(null);
+            const [editForm, setEditForm] = useState({});
+            const [dialog, setDialog] = useState(null);
+
+            const lastBatchId = useMemo(() => localStorage.getItem('wet_last_batch'), [syncing]);
+
+            // PDF.js Worker Configuration
+            useEffect(() => {
+                if (window.pdfjsLib) {
+                    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                }
+            }, []);
+
+            // Firebase Auth
+            useEffect(() => {
+                let isMounted = true;
+                const initAuth = async () => {
+                    try {
+                        await auth.signInAnonymously();
+                    } catch (e) {
+                        console.error("Token expired. Re-authenticating anonymously:", e);
+                        if (isMounted) setDbStatus('auth-failed');
+                    }
+                };
+                initAuth();
+                const unsubscribe = auth.onAuthStateChanged((u) => {
+                    if (isMounted) setUser(u);
+                });
+                return () => {
+                    isMounted = false;
+                    unsubscribe();
+                };
+            }, []);
+
+            // Firebase Realtime Listener
+            useEffect(() => {
+                if (!user) return;
+                setLoading(true);
+                const colRef = getLedgerRef();
+                
+                const unsub = colRef.onSnapshot((snap) => {
+                    const data = [];
+                    snap.forEach(doc => data.push({ ...doc.data(), id: doc.id }));
+                    setLedger(data);
+                    setLoading(false);
+                    setDbStatus('connected');
+                    setStatusMsg(null);
+                }, (err) => {
+                    if (err.message.includes('permission') || err.message.includes('Missing or insufficient permissions')) {
+                        setDbStatus('blocked');
+                        setStatusMsg({ type: 'error', text: `FIREBASE BLOCKED: Go to Firestore Rules and set 'allow read, write: if true;'` });
+                    } else {
+                        setDbStatus('error');
+                        setStatusMsg({ type: 'error', text: `Sync Error: ${err.message}` });
+                    }
+                    setLoading(false);
+                });
+                return () => unsub();
+            }, [user]);
+
+            // Unique Categories for Filtering
+            const allCategories = useMemo(() => {
+                return [...new Set(ledger.map(tx => tx.cat || 'General'))].sort();
+            }, [ledger]);
+
+            const toggleCategoryFilter = (cat) => {
+                const next = new Set(excludedCats);
+                if (next.has(cat)) next.delete(cat);
+                else next.add(cat);
+                setExcludedCats(next);
+            };
+
+            // --- THE ULTIMATE ROUTER & PARSER ---
+            const processUltimateRaw = async (rawText, batchId) => {
+                const lines = rawText.split(/\r?\n/).filter(l => l.trim().length > 0);
+                if (lines.length === 0) return;
+                const firstLine = lines[0].toLowerCase();
+                
+                const isStructuredCSV = (firstLine.includes('date') || firstLine.includes('timestamp') || firstLine.includes('column 1')) 
+                                        && firstLine.includes(',') 
+                                        && !firstLine.includes('account no') 
+                                        && !firstLine.includes('account statement') 
+                                        && !firstLine.includes('scb');
+
+                const transactionsToSave = [];
+                const occurrenceTracker = {}; 
+
+                if (isStructuredCSV) {
+                     const headers = firstLine.replace(/^\uFEFF/, '').replace(/"/g, '').split(',').map(h => h.trim());
+                     lines.slice(1).forEach(line => {
+                         const cols = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(c => c.replace(/"/g, '').trim());
+                         const row = {};
+                         headers.forEach((h, idx) => { row[h] = cols[idx] || ''; });
+                         
+                         const amtRaw = row['amount'] || row['credit/debit'] || row['total amount'] || row['amount paid'];
+                         if (!amtRaw) return;
+
+                         const amt = parseCurrency(amtRaw);
+                         let dateStr = row['date'] || row['column 1'] || row['timestamp'] || '';
+                         let timeStr = row['time'] || '';
+                         
+                         if (dateStr.includes(' ')) {
+                             timeStr = dateStr.split(' ')[1] || timeStr;
+                             dateStr = dateStr.split(' ')[0];
+                         }
+
+                         if (dateStr && dateStr.toLowerCase() !== 'date' && dateStr.toLowerCase() !== 'column 1' && dateStr.toLowerCase() !== 'timestamp' && amt !== 0) {
+                             let type = String(amtRaw).trim().startsWith('-') ? 'Expense' : 'Income';
+                             if (row['amount paid']) type = 'Expense'; 
+                             
+                             const typeHint = String(row['type'] || row['payment or income?'] || '').toUpperCase();
+                             if (typeHint.includes('PAYMENT') || typeHint.includes('EXPENSE') || typeHint.includes('DEBIT')) type = 'Expense';
+                             if (typeHint.includes('INCOME') || typeHint.includes('CREDIT')) type = 'Income';
+                             
+                             const catHint = row['category'] && row['category'].trim() !== '' ? row['category'].trim() : 'General';
+
+                             const tx = {
+                                 date: timeStr ? `${dateStr} ${timeStr}` : dateStr,
+                                 amt: Math.abs(amt),
+                                 type: type,
+                                 desc: row['description'] || row['paid for what?'] || '',
+                                 note: row['note'] || row['notes'] || '',
+                                 cat: catHint,
+                                 chan: row['channel'] || row['paid from what money?'] || 'CSV',
+                                 batchId,
+                                 ts: Date.now()
+                             };
+                             
+                             if (tx.cat === 'General') applyAutoCat(tx);
+                             
+                             const safeDesc = tx.desc.replace(/[^a-zA-Z0-9]/g, '').substring(0, 15).toLowerCase();
+                             const fingerprint = `${tx.date}_${tx.amt}_${tx.type}_${safeDesc}`;
+                             occurrenceTracker[fingerprint] = (occurrenceTracker[fingerprint] || 0) + 1;
+                             
+                             tx.id = `tx_${tx.date.replace(/[^0-9]/g, '')}_${tx.amt}_${occurrenceTracker[fingerprint]}`;
+                             transactionsToSave.push(tx);
+                         }
+                     });
+                } else {
+                    let clean = rawText;
+
+                    clean = clean.replace(/["|]/g, ' ');
+                    clean = clean.replace(/,(?!\d)/g, ' '); 
+                    clean = clean.replace(/[\r\n]+/g, ' ');
+
+                    for (let i = 0; i < 3; i++) {
+                        clean = clean.replace(/\b(\d+)\s+(\d{3}(?:\.\d{1,2})?\b)/g, '$1$2');
+                    }
+
+                    let lastBalance = null;
+                    const bfMatch = clean.replace(/,/g, '').match(/(?:brought forward|ยอดยกมา|ยกมา)[^0-9]*?([\d.]+)/i);
+                    if (bfMatch) lastBalance = parseFloat(bfMatch[1]);
+
+                    const garbageList = [
+                        /TOTAL AMOUNTS \(Debit\)[\s\d.,]+TOTAL AMOUNTS \(Credit\)[\s\d.,]+TOTAL ITEMS[\s\d]+/gi,
+                        /\d{2}:\d{2}:\d{2}(?:\s*น\.)?(?:\s*\d{2}:\d{2}:\d{2}\.?)?/gi,
+                        /(?:หน้า|หนา)?\s*สาขา\s*เลขที่บัญชี\s*วันที่\s*Date\s*[\d-]+\s*CENTRALFESTIVAL SAMUI/gi,
+                        /Date\s*วันที่\s*Time\s*Code\s*Channel\s*Description\/?\s*Balance\/Baht\s*Debit\/Credit/gi,
+                        /เวลา\s*รายการ\s*(?:ช่องทาง|ของทาง)\s*ลูกหนี้\/เจ้าหนี้\s*ยอดเงินคงเหลือ\s*รายละเอ(?:ียด\/บันทึกช่วยจำ)?/gi,
+                        /This document is auto-generated[\s\S]*?(?=(?:\d{2}\/\d{2}\/(?:\d{4}|\d{2})[\s,]*)?\d{2}:\d{2}\b|$)/gi,
+                        /เอกสารฉบับนี้ออกโดยระบบอัตโนมัติ[\s\S]*?(?=(?:\d{2}\/\d{2}\/(?:\d{4}|\d{2})[\s,]*)?\d{2}:\d{2}\b|$)/gi,
+                        /SCB Call Center.*?02\s*777\s*7777/gi,
+                        /ACCOUNT STATEMENT WITH NOTES/gi,
+                        /STATEMENT OF SAVING ACCOUNT/gi,
+                        /รายการเดินบัญชี\s*พร้อมบันทึกช่วยจํา/gi,
+                        /ใบแจ้งรายการบัญชีออมทรัพย์/gi,
+                        /Account No\.\/Account Type\s*Statement Period\s*Page/gi,
+                        /Account No\./gi,
+                        /เลขที่บัญชี\/ประเภทบัญชี\s*วันที่\s*หน้า/gi,
+                        /เลขที่บัญชี\s*[\d-]+/gi,
+                        /MISTER LOREN DOUGLAS(?:\s*INFELD)?\s*(?:439-093321-8)?/gi,
+                        /INFELD Savings/gi,
+                        /Savings INFELD/gi,
+                        /THE SIAM COMMERCIAL BANK PUBLIC COMPANY LIMITED/gi,
+                        /ธนาคารไทยพาณิชย์ จำกัด \(มหาชน\)/gi,
+                        /สาขา CENTRALFESTIVAL SAMUI/gi,
+                        /ชื่อ - สกุล\s*Name/gi,
+                        /ที่อยู่\s*Address/gi,
+                        /28\/12 ม\.3 ต\.แม่น้ำ อ\.เกาะสมุย จ\.สุราษฎร์ธานี 84330/gi,
+                        /SCB\s*ไทยพาณิชย์/gi,
+                        /\d{2}\/\d{2}\/\d{4}\s*-\s*\d{2}\/\d{2}\/\d{4}/g,
+                        /Date\/Time\s*Code\/Channel\s*Debit\s*Credit\s*Balance\s*Description\/Note/gi,
+                        /Date\s*Time\s*Channel\s*Code\s*Debit\/Credit\s*Balance\/Baht\s*Description\/Note/gi,
+                        /วันที่\/เวลา\s*รายการ\/ช่องทาง\s*ลูกหนี้\s*เจ้าหนี้\s*ยอดเงินคงเหลือ\s*รายละเอียด\/บันทึกช่วยจำ/gi,
+                        /วันที่\s*เวลา\s*รายการ\s*(?:ช่องทาง|ของทาง)\s*ลูกหนี้\/เจ้าหนี้\s*ยอดเงินคงเหลือ\s*รายละเอียด\/บันทึกช่วยจำ/gi,
+                        /วันที่\/เวลา.*?บันทึกช่วยจำ/gi,
+                        /www\.scb\.co\.th/gi,
+                        /\bDESC\s*:/gi,
+                        /\bNOTE\s*:/gi,
+                        /\bDESC\b/gi,
+                        /\bNOTE\b/gi,
+                        /Page\s*\d+\s*\/\s*\d+/gi,
+                        /หนา\s*\d+\/\d+/gi,
+                        /หน้า\s*\d+\/\d+/gi,
+                        /(?:\s\b\d+\s*\/\s*\d+\b\s)/g,
+                        /ยอดเงินคงเหลือยกมา\s*\(Balance brought forward\)\s*\*{0,3}\s*[\d,.]+/gi,
+                        /ยกมา\s*\(BALANCE BROUGHT FORWARD\)\s*[\d,.]+/gi
+                    ];
+                    
+                    garbageList.forEach(g => { clean = clean.replace(g, ' '); });
+                    clean = clean.replace(/\s+/g, ' ').trim();
+
+                    const amtExp = "-?\\d[\\d,]*\\.\\d{1,2}";
+                    const chanExp = "[A-Za-z0-9]{2,4}(?:[\\/\\s][A-Za-z0-9]{2,6})?";
+                    const txAnchor = `(?:(?:\\d{2}/\\d{2}/(?:\\d{4}|\\d{2}))[\\s,]*)?\\d{2}:\\d{2}[\\s,]+${chanExp}[\\s,]+${amtExp}`;
+                    const txRegex = new RegExp(`(?:(\\d{2}/\\d{2}/(?:\\d{4}|\\d{2}))[\\s,]*)?(\\d{2}:\\d{2})[\\s,]+([A-Za-z0-9/\\s-]{2,20}?)[\\s,]+(${amtExp})[\\s,]*(?:(${amtExp})[\\s,]*)?(.*?)(?=${txAnchor}|$)`, 'gi');
+                    
+                    let match;
+                    let lastDate = "01/01/25"; 
+                    
+                    while ((match = txRegex.exec(clean)) !== null) {
+                        if (match[1]) lastDate = match[1];
+                        
+                        const time = match[2];
+                        const chan = match[3];
+                        const amtRaw = parseCurrency(match[4]);
+                        const balRaw = match[5] ? parseCurrency(match[5]) : null;
+                        
+                        let desc = match[6].trim();
+                        
+                        if (match[4] && desc.startsWith(match[4])) desc = desc.substring(match[4].length).trim();
+                        if (match[5] && desc.startsWith(match[5])) desc = desc.substring(match[5].length).trim();
+                        desc = desc.replace(/^[-|:,]+/, '').replace(/[-|:,]+$/, '').trim();
+
+                        let type = 'Expense';
+                        if (amtRaw < 0) {
+                            type = 'Expense';
+                        } else if (lastBalance !== null && balRaw !== null) {
+                            const diff = balRaw - lastBalance;
+                            if (Math.abs(diff - Math.abs(amtRaw)) < 0.1) type = 'Income';
+                            else if (Math.abs(diff + Math.abs(amtRaw)) < 0.1) type = 'Expense';
+                            else type = balRaw > lastBalance ? 'Income' : 'Expense';
+                        } else {
+                            if (/deposit|income|c1\/|refund|promptpay/i.test(chan + ' ' + desc)) {
+                                type = 'Income';
+                            }
+                        }
+                        if (balRaw !== null) lastBalance = balRaw;
+
+                        const tx = {
+                            date: `${lastDate} ${time}`,
+                            amt: Math.abs(amtRaw),
+                            type,
+                            desc: desc.substring(0, 300),
+                            note: '', 
+                            chan: chan.trim(),
+                            cat: 'General',
+                            batchId,
+                            ts: Date.now()
+                        };
+
+                        applyAutoCat(tx);
+                        
+                        const safeDesc = tx.desc.replace(/[^a-zA-Z0-9]/g, '').substring(0, 15).toLowerCase();
+                        const fingerprint = `${tx.date}_${tx.amt}_${tx.type}_${safeDesc}`;
+                        occurrenceTracker[fingerprint] = (occurrenceTracker[fingerprint] || 0) + 1;
+                        
+                        tx.id = `tx_${lastDate.replace(/[^0-9]/g, '')}_${time.replace(':','')}__${tx.amt}_${occurrenceTracker[fingerprint]}`;
+                        transactionsToSave.push(tx);
+                    }
+                }
+
+                let savedCount = 0;
+                const CHUNK_SIZE = 200;
+                const colRef = getLedgerRef();
+
+                for (let i = 0; i < transactionsToSave.length; i += CHUNK_SIZE) {
+                    const batch = db.batch();
+                    transactionsToSave.slice(i, i + CHUNK_SIZE).forEach(entry => {
+                        batch.set(colRef.doc(entry.id), entry);
+                        savedCount++;
+                    });
+                    await batch.commit();
+                }
+
+                localStorage.setItem('wet_last_batch', batchId);
+                setSyncing(false);
+                setStatusMsg({ type: 'success', text: `Success: Perfectly mapped & extracted ${savedCount} records.` });
+                setTimeout(() => setStatusMsg(null), 8000);
+            };
+
+            const handleImport = async (e) => {
+                const file = e.target.files[0];
+                if (!file || !user) return;
+                if (dbStatus === 'blocked') {
+                    setStatusMsg({ type: 'error', text: `Cannot import: Firebase Database is blocked by Security Rules.` });
+                    e.target.value = null;
+                    return;
+                }
+
+                setSyncing(true);
+                const batchId = `import_${Date.now()}`;
+                setStatusMsg({ type: 'info', text: "Analyzing file structure..." });
+
+                try {
+                    let fullText = '';
+                    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+                        if (!window.pdfjsLib) throw new Error("PDF Library is still loading. Please try again.");
+                        const arrayBuffer = await file.arrayBuffer();
+                        const pdf = await window.pdfjsLib.getDocument(arrayBuffer).promise;
+                        
+                        for (let i = 1; i <= pdf.numPages; i++) {
+                            const page = await pdf.getPage(i);
+                            const content = await page.getTextContent();
+                            fullText += content.items.map(item => item.str).join(' ') + ' ';
+                        }
+                    } else {
+                        fullText = await new Promise((resolve, reject) => {
+                            const r = new FileReader();
+                            r.onload = evt => resolve(evt.target.result);
+                            r.onerror = e => reject(e);
+                            r.readAsText(file);
+                        });
+                    }
+                    await processUltimateRaw(fullText, batchId);
+                } catch (err) {
+                    setSyncing(false);
+                    setStatusMsg({ type: 'error', text: `Import failed: ${err.message}` });
+                }
+                e.target.value = null;
+            };
+
+            // --- MANAGEMENT TOOLS ---
+            const applyRulesToExisting = () => {
+                if (dbStatus === 'blocked') return setStatusMsg({ type: 'error', text: "Database blocked." });
+                if (ledger.length === 0) {
+                    setStatusMsg({ type: 'error', text: "Database is empty. Nothing to tag." });
+                    setTimeout(() => setStatusMsg(null), 3000);
+                    return;
+                }
+                setDialog({
+                    title: "Auto-Tag Records",
+                    message: "Scan the entire database and auto-apply categorization rules to all existing entries?",
+                    confirmText: "Auto-Tag Now",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        setStatusMsg({ type: 'info', text: "Applying smart rules to database..." });
+                        try {
+                            let updates = 0;
+                            const CHUNK = 400;
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < ledger.length; i += CHUNK) {
+                                const batch = db.batch();
+                                const chunk = ledger.slice(i, i + CHUNK);
+                                
+                                chunk.forEach(item => {
+                                    const originalCat = item.cat;
+                                    applyAutoCat(item);
+                                    if (originalCat !== item.cat) {
+                                        batch.set(colRef.doc(item.id), { cat: item.cat }, { merge: true });
+                                        updates++;
+                                    }
+                                });
+                                await batch.commit();
+                            }
+                            setStatusMsg({ type: 'success', text: `Auto-categorized ${updates} records.` });
+                        } catch (err) {
+                            setStatusMsg({ type: 'error', text: `Failed: ${err.message}` });
+                        }
+                        setSyncing(false);
+                        setTimeout(() => setStatusMsg(null), 4000);
+                    }
+                });
+            };
+
+            const bulkCategorize = () => {
+                if (dbStatus === 'blocked') return setStatusMsg({ type: 'error', text: "Database blocked." });
+                setDialog({
+                    type: 'prompt',
+                    title: "Bulk Categorize",
+                    message: `Assign a new category to the ${selected.size} selected rows:`,
+                    confirmText: "Save Category",
+                    onConfirm: async (cat) => {
+                        if (!cat || !cat.trim()) return;
+                        setSyncing(true);
+                        try {
+                            const CHUNK = 400;
+                            const ids = Array.from(selected);
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < ids.length; i += CHUNK) {
+                                const batch = db.batch();
+                                ids.slice(i, i + CHUNK).forEach(id => {
+                                    batch.set(colRef.doc(id), { cat: cat.trim() }, { merge: true });
+                                });
+                                await batch.commit();
+                            }
+                            setSelected(new Set());
+                            setStatusMsg({ type: 'success', text: "Categories updated." });
+                        } catch (err) {
+                            setStatusMsg({ type: 'error', text: `Update failed: ${err.message}` });
+                        }
+                        setSyncing(false);
+                        setTimeout(() => setStatusMsg(null), 4000);
+                    }
+                });
+            };
+
+            const triggerDelete = (ids) => {
+                if (dbStatus === 'blocked') return setStatusMsg({ type: 'error', text: "Database blocked." });
+                if (!ids || ids.length === 0) {
+                    setStatusMsg({ type: 'error', text: "No items available to delete." });
+                    setTimeout(() => setStatusMsg(null), 3000);
+                    return;
+                }
+                setDialog({
+                    title: "Confirm Deletion",
+                    message: `Are you sure you want to permanently wipe ${ids.length} records? This action cannot be undone.`,
+                    danger: true,
+                    confirmText: "Yes, Delete",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        const CHUNK = 400;
+                        const colRef = getLedgerRef();
+                        try {
+                            for (let i = 0; i < ids.length; i += CHUNK) {
+                                const batch = db.batch();
+                                ids.slice(i, i + CHUNK).forEach(id => {
+                                    batch.delete(colRef.doc(id));
+                                });
+                                await batch.commit();
+                            }
+                            setSelected(new Set());
+                            setStatusMsg({ type: 'success', text: "Database records removed." });
+                        } catch (e) {
+                            setStatusMsg({ type: 'error', text: `Delete failed: ${e.message}` });
+                        }
+                        setSyncing(false);
+                        setTimeout(() => setStatusMsg(null), 3000);
+                    }
+                });
+            };
+
+            const undoLastImport = () => {
+                const lastId = localStorage.getItem('wet_last_batch');
+                if (!lastId) {
+                    setStatusMsg({ type: 'error', text: "No previous import found to undo." });
+                    setTimeout(() => setStatusMsg(null), 3000);
+                    return;
+                }
+                const toDelete = ledger.filter(i => i.batchId === lastId).map(i => i.id);
+                if (toDelete.length > 0) {
+                    triggerDelete(toDelete);
+                    localStorage.removeItem('wet_last_batch');
+                } else {
+                    setStatusMsg({ type: 'error', text: "No records found from the last import." });
+                    setTimeout(() => setStatusMsg(null), 3000);
+                }
+            };
+
+            // --- DATA VIEW & FILTER LOGIC ---
+            const filtered = useMemo(() => {
+                let list = ledger.filter(i => {
+                    // Exclude categories based on filter toggles
+                    if (excludedCats.has(i.cat || 'General')) return false;
+
+                    if (searchTerm) {
+                        const s = searchTerm.toLowerCase();
+                        return (i.desc && i.desc.toLowerCase().includes(s)) || 
+                               (i.cat && i.cat.toLowerCase().includes(s)) || 
+                               (i.date && i.date.includes(s));
+                    }
+                    return true;
+                });
+
+                return list.sort((a, b) => {
+                    const f = sort.dir === 'asc' ? 1 : -1;
+                    if (sort.key === 'date') return (normalizeDate(a.date) - normalizeDate(b.date)) * f;
+                    return ((a[sort.key] || 0) > (b[sort.key] || 0) ? 1 : -1) * f;
+                });
+            }, [ledger, searchTerm, sort, excludedCats]);
+
+            const totals = useMemo(() => filtered.reduce((acc, i) => {
+                const amount = i.amt || 0;
+                if (i.type === 'Income') acc.inc += amount; else acc.exp += amount;
+                return acc;
+            }, { inc: 0, exp: 0 }), [filtered]);
+
+            // --- REPORTS LOGIC ---
+            const reportStats = useMemo(() => {
+                const monthly = {};
+                const yearly = {};
+                
+                filtered.forEach(tx => {
+                    const d = normalizeDate(tx.date);
+                    if (d.getFullYear() === 1970) return; // Skip severely invalid dates
+                    
+                    const yr = `${d.getFullYear()}`;
+                    const mo = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2, '0')}`;
+                    
+                    if(!monthly[mo]) monthly[mo] = { label: mo, inc: 0, exp: 0 };
+                    if(!yearly[yr]) yearly[yr] = { label: yr, inc: 0, exp: 0 };
+                    
+                    const amount = tx.amt || 0;
+                    if (tx.type === 'Income') {
+                        monthly[mo].inc += amount;
+                        yearly[yr].inc += amount;
+                    } else {
+                        monthly[mo].exp += amount;
+                        yearly[yr].exp += amount;
+                    }
+                });
+
+                return {
+                    monthly: Object.values(monthly).sort((a,b) => b.label.localeCompare(a.label)),
+                    yearly: Object.values(yearly).sort((a,b) => b.label.localeCompare(a.label))
+                };
+            }, [filtered]);
+
+            if (loading && !user) {
+                return (
+                    <div className="h-screen flex flex-col items-center justify-center bg-slate-50 text-slate-900">
+                        <i className="ph ph-spinner animate-spin text-blue-600 mb-4 text-4xl"></i>
+                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Initializing Live Database...</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="h-screen flex flex-col bg-[#fdfdfd] text-xs font-sans text-slate-900 overflow-hidden relative">
+                    
+                    {/* Definitive Header */}
+                    <header className="bg-white border-b flex flex-col md:flex-row items-center justify-between px-6 py-4 md:h-20 shrink-0 z-30 shadow-sm gap-4">
+                        <div className="flex items-center gap-6 w-full md:w-auto justify-between md:justify-start">
+                            <div className="flex items-center gap-3">
+                                <div className="bg-slate-900 text-white p-2.5 rounded-xl shadow-lg">
+                                    <i className="ph ph-database text-xl"></i>
+                                </div>
+                                <div>
+                                    <div className="font-black text-slate-900 text-xl tracking-tighter leading-none">WET<span className="text-blue-600">LEDGER</span></div>
+                                    <div className="text-[9px] font-bold text-blue-500 uppercase tracking-widest mt-0.5">Dual Matrix Scanner</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-3 md:gap-5 w-full md:w-auto justify-center md:justify-end">
+                            
+                            {/* Navigation Tabs */}
+                            <div className="flex bg-slate-100 p-1 rounded-xl shadow-inner mr-2">
+                                <button onClick={() => setActiveTab('ledger')} className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${activeTab === 'ledger' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                                    <i className="ph ph-list-dashes text-sm"></i> Ledger
+                                </button>
+                                <button onClick={() => setActiveTab('reports')} className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${activeTab === 'reports' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                                    <i className="ph ph-chart-bar text-sm"></i> Reports
+                                </button>
+                            </div>
+
+                            {/* Search & Filter Trigger */}
+                            {activeTab === 'ledger' && (
+                                <div className="relative flex gap-2 w-full md:w-auto">
+                                    <div className="relative flex-1 md:w-64">
+                                        <i className="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-base"></i>
+                                        <input 
+                                            className="pl-9 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl w-full outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all shadow-inner font-medium text-xs" 
+                                            placeholder="Search records..." 
+                                            value={searchTerm} 
+                                            onChange={e => setSearchTerm(e.target.value)} 
+                                        />
+                                    </div>
+                                    <button 
+                                        onClick={() => setShowFilters(!showFilters)} 
+                                        className={`px-3 py-2 border rounded-xl flex items-center gap-1 transition-all ${showFilters || excludedCats.size > 0 ? 'bg-blue-50 border-blue-200 text-blue-600 shadow-inner' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
+                                        title="Filter Categories"
+                                    >
+                                        <i className="ph ph-funnel text-base"></i>
+                                        {excludedCats.size > 0 && <span className="bg-blue-600 text-white text-[9px] font-bold px-1.5 rounded-full">{excludedCats.size}</span>}
+                                    </button>
+                                </div>
+                            )}
+
+                            {/* Utility Buttons */}
+                            {activeTab === 'ledger' && (
+                                <div className="flex gap-2">
+                                    <label className="bg-blue-600 text-white px-5 py-2.5 rounded-xl font-black cursor-pointer hover:bg-blue-700 transition-all flex items-center gap-2 text-[10px] uppercase shadow-lg active:scale-95">
+                                        <i className="ph ph-file-text text-base"></i> IMPORT
+                                        <input type="file" accept=".csv, .pdf, text/csv, application/pdf" className="hidden" onChange={handleImport} />
+                                    </label>
+                                    {lastBatchId && (
+                                        <button onClick={undoLastImport} className="p-2.5 text-orange-500 hover:bg-orange-50 border border-orange-100 rounded-xl transition-all shadow-sm" title="Undo Last Batch">
+                                            <i className="ph ph-arrow-u-up-left text-lg"></i>
+                                        </button>
+                                    )}
+                                    <button onClick={() => triggerDelete(ledger.map(i => i.id))} className="p-2.5 text-slate-400 hover:text-red-600 border border-slate-200 rounded-xl transition-all shadow-sm hover:border-red-200 hover:bg-red-50" title="Wipe Database">
+                                        <i className="ph ph-eraser text-lg"></i>
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </header>
+
+                    {/* Filter Panel (Dropdown) */}
+                    {showFilters && activeTab === 'ledger' && (
+                        <div className="bg-slate-50 border-b border-slate-200 px-6 py-3 flex flex-wrap items-center gap-2 z-20 shadow-inner animate-in slide-in-from-top-2">
+                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest mr-2">Exclude Categories:</span>
+                            {allCategories.map(cat => (
+                                <button 
+                                    key={cat}
+                                    onClick={() => toggleCategoryFilter(cat)}
+                                    className={`px-3 py-1 rounded-full text-[10px] font-bold border transition-colors flex items-center gap-1 ${excludedCats.has(cat) ? 'bg-slate-200 border-slate-300 text-slate-500 opacity-60 line-through' : 'bg-white border-blue-200 text-blue-700 shadow-sm'}`}
+                                >
+                                    {excludedCats.has(cat) ? <i className="ph ph-x"></i> : <i className="ph ph-check"></i>}
+                                    {cat}
+                                </button>
+                            ))}
+                            {excludedCats.size > 0 && (
+                                <button onClick={() => setExcludedCats(new Set())} className="ml-auto text-[10px] font-bold text-blue-600 hover:underline">Clear Filters</button>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Status Alerts */}
+                    {statusMsg && (
+                        <div className={`absolute top-24 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-5 py-3 rounded-xl text-[11px] font-bold shadow-2xl animate-in fade-in slide-in-from-top-4 duration-300 ${statusMsg.type === 'error' ? 'bg-red-600 text-white' : 'bg-emerald-600 text-white'}`}>
+                            {statusMsg.type === 'error' ? <i className="ph ph-warning text-lg"></i> : <i className="ph ph-check-circle text-lg"></i>}
+                            {statusMsg.text}
+                        </div>
+                    )}
+
+                    {/* Accuracy Banner */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 border-b bg-white divide-x divide-y md:divide-y-0 divide-slate-100 shrink-0 z-10 shadow-sm">
+                        <div className="p-4 md:p-5 bg-emerald-50/20">
+                            <div className="flex items-center gap-2 mb-1">
+                                <div className="p-1.5 bg-emerald-100 rounded-lg text-emerald-600"><i className="ph ph-arrow-up-right text-sm"></i></div>
+                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em]">Filtered Income</p>
+                            </div>
+                            <p className="text-xl md:text-3xl font-black text-emerald-600 tracking-tight">฿{totals.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                        </div>
+                        
+                        <div className="p-4 md:p-5 bg-rose-50/20">
+                            <div className="flex items-center gap-2 mb-1">
+                                <div className="p-1.5 bg-rose-100 rounded-lg text-rose-600"><i className="ph ph-arrow-down-left text-sm"></i></div>
+                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em]">Filtered Expense</p>
+                            </div>
+                            <p className="text-xl md:text-3xl font-black text-rose-600 tracking-tight">฿{totals.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                        </div>
+
+                        <div className="p-4 md:p-5 bg-blue-50/20">
+                            <div className="flex items-center gap-2 mb-1">
+                                <div className="p-1.5 bg-blue-100 rounded-lg text-blue-600"><i className="ph ph-wallet text-sm"></i></div>
+                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em]">Filtered Net</p>
+                            </div>
+                            <p className={`text-xl md:text-3xl font-black tracking-tight ${totals.inc - totals.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>฿{(totals.inc - totals.exp).toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                        </div>
+
+                        <div className="p-4 md:p-5 flex flex-col justify-center items-end bg-slate-50/50">
+                            {selected.size > 0 && activeTab === 'ledger' ? (
+                                <div className="flex gap-2 w-full h-full">
+                                    <button onClick={bulkCategorize} className="flex-1 bg-slate-900 text-white rounded-xl font-black uppercase text-[10px] shadow-xl hover:bg-black flex items-center justify-center gap-1.5 transition-colors"><i className="ph ph-tag text-base"></i> Tag</button>
+                                    <button onClick={() => triggerDelete(Array.from(selected))} className="flex-1 bg-red-600 text-white rounded-xl font-black uppercase text-[10px] shadow-xl hover:bg-red-700 flex items-center justify-center gap-1.5 transition-colors"><i className="ph ph-trash text-base"></i> Del</button>
+                                </div>
+                            ) : (
+                                <div className="flex flex-col items-end gap-2 w-full">
+                                    {activeTab === 'ledger' && (
+                                        <button onClick={applyRulesToExisting} className="w-full bg-indigo-100 text-indigo-700 px-3 py-2 rounded-xl font-black uppercase text-[10px] flex items-center justify-center gap-1.5 hover:bg-indigo-200 transition-colors shadow-sm" title="Scan database and apply category rules">
+                                            <i className="ph ph-magic-wand text-base"></i> Auto-Tag DB
+                                        </button>
+                                    )}
+                                    <div className="flex items-center gap-1.5 text-[10px] font-bold text-blue-600 uppercase tracking-widest mt-1">
+                                        <i className="ph ph-check-circle text-sm"></i> {excludedCats.size > 0 ? 'Filters Active' : 'Live Data Ready'}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* MAIN CONTENT AREA */}
+                    <main className="flex-1 overflow-y-auto overflow-x-hidden bg-white relative">
+                        
+                        {/* TAB: LEDGER */}
+                        {activeTab === 'ledger' && (
+                            <div className="w-full overflow-x-auto block">
+                                <table className="w-full min-w-[800px] text-left border-collapse table-fixed">
+                                    <thead className="sticky top-0 bg-slate-50 z-20 border-b shadow-sm">
+                                        <tr className="text-slate-500 font-black uppercase text-[9px] tracking-[0.15em]">
+                                            <th className="p-3 md:p-4 w-12 text-center border-r border-slate-100">
+                                                <button onClick={() => {
+                                                    if (selected.size === filtered.length && filtered.length > 0) setSelected(new Set());
+                                                    else setSelected(new Set(filtered.map(i => i.id)));
+                                                }}>
+                                                    {selected.size > 0 && selected.size === filtered.length ? <i className="ph ph-check-square text-lg text-blue-600"></i> : <i className="ph ph-square text-lg"></i>}
+                                                </button>
+                                            </th>
+                                            <th className="p-3 md:p-4 w-32 cursor-pointer hover:text-blue-600 transition-colors border-r border-slate-100" onClick={() => setSort({key:'date', dir: sort.dir==='asc'?'desc':'asc'})}>Date / Time</th>
+                                            <th className="p-3 md:p-4 w-24 border-r border-slate-100">Type</th>
+                                            <th className="p-3 md:p-4 text-right w-32 cursor-pointer hover:text-blue-600 border-r border-slate-100" onClick={() => setSort({key:'amt', dir: sort.dir==='asc'?'desc':'asc'})}>Amount</th>
+                                            <th className="p-3 md:p-4 border-r border-slate-100">Description</th>
+                                            <th className="p-3 md:p-4 w-32 border-r border-slate-100">Category</th>
+                                            <th className="p-3 md:p-4 w-16"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100 text-[11px]">
+                                        {filtered.map(item => (
+                                            <tr key={item.id} className={`hover:bg-blue-50/40 transition-all group ${selected.has(item.id) ? 'bg-blue-50/60' : ''}`}>
+                                                <td className="p-3 md:p-4 text-center border-r border-slate-50">
+                                                    <button onClick={() => {
+                                                        const next = new Set(selected);
+                                                        if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
+                                                        setSelected(next);
+                                                    }}>
+                                                        {selected.has(item.id) ? <i className="ph ph-check-square text-lg text-blue-600"></i> : <i className="ph ph-square text-lg text-slate-200 group-hover:text-slate-400"></i>}
+                                                    </button>
+                                                </td>
+                                                <td className="p-3 md:p-4 font-mono text-slate-500 leading-tight border-r border-slate-50">{item.date}</td>
+                                                <td className="p-3 md:p-4 border-r border-slate-50">
+                                                    <span className={`px-2 py-1 rounded-md text-[9px] font-black uppercase tracking-widest shadow-sm ${item.type === 'Income' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{item.type}</span>
+                                                </td>
+                                                <td className={`p-3 md:p-4 text-right font-black text-sm border-r border-slate-50 ${item.type === 'Income' ? 'text-emerald-600' : 'text-rose-600'}`}>฿{(item.amt || 0).toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                <td className="p-3 md:p-4 align-top border-r border-slate-50 whitespace-normal">
+                                                    <p className="font-bold text-slate-800 leading-snug">{item.desc}</p>
+                                                    {item.note && <p className="text-[10px] text-slate-400 mt-1 italic leading-tight">{item.note}</p>}
+                                                </td>
+                                                <td className="p-3 md:p-4 border-r border-slate-50 whitespace-normal">
+                                                    <span className="bg-slate-100 border border-slate-200 px-2 py-1 rounded text-[9px] text-slate-500 font-bold uppercase truncate block text-center">{item.cat || 'General'}</span>
+                                                </td>
+                                                <td className="p-3 md:p-4 opacity-0 group-hover:opacity-100 text-right space-x-2">
+                                                    <button onClick={() => {setEditId(item.id); setEditForm({...item})}} className="text-slate-300 hover:text-blue-600 transition-colors"><i className="ph ph-pencil-simple text-lg"></i></button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                                
+                                {filtered.length === 0 && !syncing && (
+                                    <div className="py-40 text-center flex flex-col items-center gap-4 text-slate-300">
+                                        <i className="ph ph-cloud text-6xl"></i>
+                                        <div className="space-y-2">
+                                            <p className="font-black uppercase tracking-[0.4em] text-sm text-slate-400">No Data Found</p>
+                                            <p className="text-xs font-medium opacity-60 max-w-sm mx-auto leading-relaxed">Upload CSVs or drop raw Bank Statement PDFs. Try clearing filters if applied.</p>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* TAB: REPORTS */}
+                        {activeTab === 'reports' && (
+                            <div className="p-6 md:p-10 max-w-5xl mx-auto space-y-12">
+                                <div>
+                                    <h2 className="text-xl font-black text-slate-800 uppercase tracking-widest mb-6 flex items-center gap-2"><i className="ph ph-calendar-blank text-blue-600"></i> Monthly Breakdown</h2>
+                                    <div className="bg-white rounded-2xl border shadow-sm overflow-hidden">
+                                        <table className="w-full text-left border-collapse">
+                                            <thead className="bg-slate-50 border-b">
+                                                <tr className="text-slate-500 font-black uppercase text-[10px] tracking-widest">
+                                                    <th className="p-4 border-r border-slate-100">Month</th>
+                                                    <th className="p-4 text-right border-r border-slate-100">Income</th>
+                                                    <th className="p-4 text-right border-r border-slate-100">Expense</th>
+                                                    <th className="p-4 text-right bg-slate-100/50">Net Profit</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-slate-100 text-sm">
+                                                {reportStats.monthly.map(stat => (
+                                                    <tr key={stat.label} className="hover:bg-slate-50 transition-colors">
+                                                        <td className="p-4 font-black text-slate-700 border-r border-slate-50">{stat.label}</td>
+                                                        <td className="p-4 text-right font-bold text-emerald-600 border-r border-slate-50">฿{stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                        <td className="p-4 text-right font-bold text-rose-600 border-r border-slate-50">฿{stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                        <td className={`p-4 text-right font-black bg-slate-50/50 ${stat.inc - stat.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>
+                                                            ฿{(stat.inc - stat.exp).toLocaleString(undefined, {minimumFractionDigits:2})}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <div>
+                                    <h2 className="text-xl font-black text-slate-800 uppercase tracking-widest mb-6 flex items-center gap-2"><i className="ph ph-calendar text-blue-600"></i> Yearly Breakdown</h2>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                        {reportStats.yearly.map(stat => (
+                                            <div key={stat.label} className="bg-white rounded-2xl border shadow-sm p-6 flex flex-col justify-between">
+                                                <h3 className="text-3xl font-black text-slate-800 mb-6">{stat.label}</h3>
+                                                <div className="space-y-4">
+                                                    <div className="flex justify-between items-center pb-3 border-b border-slate-100">
+                                                        <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Income</span>
+                                                        <span className="font-bold text-emerald-600">฿{stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                                                    </div>
+                                                    <div className="flex justify-between items-center pb-3 border-b border-slate-100">
+                                                        <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Expense</span>
+                                                        <span className="font-bold text-rose-600">฿{stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                                                    </div>
+                                                    <div className="flex justify-between items-center pt-2">
+                                                        <span className="text-[11px] font-black text-slate-900 uppercase tracking-widest">Net Profit</span>
+                                                        <span className={`text-xl font-black ${stat.inc - stat.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>
+                                                            ฿{(stat.inc - stat.exp).toLocaleString(undefined, {minimumFractionDigits:2})}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+
+                    {/* Global Status Footer */}
+                    <footer className="bg-white border-t flex flex-col md:flex-row items-center justify-between px-6 py-2 md:h-10 shrink-0 z-30 shadow-2xl gap-2">
+                        <div className="flex items-center gap-4 md:gap-6">
+                            <div className="flex items-center gap-2">
+                                {dbStatus === 'blocked' ? <i className="ph ph-plugs text-red-500"></i> : <div className={`w-2 h-2 rounded-full ${user && dbStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`}></div>}
+                                <span className={`text-[9px] font-black uppercase tracking-[0.2em] ${dbStatus === 'blocked' ? 'text-red-500' : 'text-slate-500'}`}>{dbStatus === 'blocked' ? 'DB BLOCKED (CHECK RULES)' : user ? 'Live Firebase Stable' : 'Sync Offline'}</span>
+                            </div>
+                            <div className="hidden md:block h-4 w-px bg-slate-200"></div>
+                            <span className="hidden md:inline text-[9px] text-slate-400 font-bold uppercase tracking-widest">Path: /artifacts/{appId}/public/data/ledger</span>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            {syncing && <div className="flex items-center gap-2 text-blue-600 font-black text-[9px] animate-pulse"><i className="ph ph-arrows-clockwise animate-spin text-sm"></i> SYNCING TO CLOUD</div>}
+                            <div className="hidden md:block h-4 w-px bg-slate-200"></div>
+                            <span className="text-[10px] text-slate-900 font-black tracking-tighter uppercase">Cloud Records: {ledger.length.toLocaleString()}</span>
+                        </div>
+                    </footer>
+
+                    {/* Edit Modal (Updated with Date Field) */}
+                    {editId && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                            <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+                                <div className="flex justify-between items-center border-b p-6 bg-slate-50">
+                                    <h3 className="font-black uppercase tracking-widest text-slate-900 text-lg flex items-center gap-2"><i className="ph ph-pencil-simple text-blue-600"></i> Edit Record</h3>
+                                    <button onClick={() => setEditId(null)} className="text-slate-400 hover:text-slate-600 bg-slate-200 hover:bg-slate-300 p-2 rounded-full transition-colors"><i className="ph ph-x"></i></button>
+                                </div>
+                                
+                                <div className="p-6 space-y-5 overflow-y-auto max-h-[70vh]">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                                        <div className="space-y-1.5">
+                                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Date / Time (DD/MM/YY HH:MM)</label>
+                                            <input className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all" type="text" value={editForm.date || ''} onChange={e => setEditForm({...editForm, date: e.target.value})}/>
+                                        </div>
+                                        <div className="space-y-1.5">
+                                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Amount (฿)</label>
+                                            <input className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all" type="number" step="0.01" value={editForm.amt || ''} onChange={e => setEditForm({...editForm, amt: parseCurrency(e.target.value)})}/>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Category</label>
+                                        <input className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all" value={editForm.cat || ''} onChange={e => setEditForm({...editForm, cat: e.target.value})}/>
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Description & Notes</label>
+                                        <textarea className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-medium focus:border-blue-500 outline-none transition-all" rows={4} value={editForm.desc || ''} onChange={e => setEditForm({...editForm, desc: e.target.value})}/>
+                                    </div>
+                                </div>
+
+                                <div className="p-6 border-t bg-slate-50 flex gap-3">
+                                    <button onClick={() => triggerDelete([editId])} className="px-6 py-4 bg-red-100 hover:bg-red-200 text-red-700 font-black rounded-xl transition-all"><i className="ph ph-trash text-lg"></i></button>
+                                    <button onClick={async () => {
+                                        setSyncing(true);
+                                        try {
+                                            const updateData = {
+                                                date: editForm.date,
+                                                amt: editForm.amt,
+                                                cat: editForm.cat,
+                                                desc: editForm.desc
+                                            };
+                                            const colRef = getLedgerRef();
+                                            await colRef.doc(editId).set(updateData, { merge: true });
+                                            setEditId(null);
+                                            setStatusMsg({ type: 'success', text: "Record updated successfully." });
+                                        } catch (e) { 
+                                            setStatusMsg({ type: 'error', text: `Save failed: ${e.message}` }); 
+                                        }
+                                        setSyncing(false);
+                                    }} className="flex-1 bg-blue-600 text-white font-black py-4 rounded-xl shadow-lg hover:bg-blue-700 active:scale-95 transition-all uppercase tracking-widest flex justify-center items-center gap-2">
+                                        <i className="ph ph-floppy-disk text-lg"></i> Save Changes
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Global Confirmation / Prompt Modal */}
+                    {dialog && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                            <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm space-y-4 animate-in zoom-in-95 duration-200">
+                                <h3 className="font-black uppercase tracking-widest text-slate-900 text-lg">{dialog.title}</h3>
+                                <p className="text-sm font-medium text-slate-600 leading-relaxed">{dialog.message}</p>
+                                {dialog.type === 'prompt' && (
+                                    <input 
+                                        autoFocus 
+                                        className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all mt-2" 
+                                        value={dialog.inputValue || ''} 
+                                        onChange={e => setDialog({...dialog, inputValue: e.target.value})} 
+                                        placeholder="Enter category name..." 
+                                    />
+                                )}
+                                <div className="flex gap-3 pt-4 border-t mt-4">
+                                    <button onClick={() => setDialog(null)} className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 rounded-xl font-bold text-slate-600 transition-colors">Cancel</button>
+                                    <button 
+                                        onClick={() => { 
+                                            dialog.onConfirm(dialog.inputValue); 
+                                            setDialog(null); 
+                                        }} 
+                                        className={`flex-1 py-3 text-white rounded-xl font-bold shadow-lg transition-all ${dialog.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
+                                    >
+                                        {dialog.confirmText || 'Confirm'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
