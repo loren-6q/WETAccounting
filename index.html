@@ -33,13 +33,19 @@
         ::-webkit-scrollbar-track { background: #f1f5f9; }
         ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        /* Bar chart animations */
+        @keyframes growUp { from { height: 0; } }
+        @keyframes growRight { from { width: 0; } }
+        .animate-grow-up { animation: growUp 0.8s ease-out forwards; }
+        .animate-grow-right { animation: growRight 0.8s ease-out forwards; }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useMemo, useEffect } = React;
+        const { useState, useMemo, useEffect, useRef } = React;
 
         // ==========================================
         // 1. FIREBASE CONFIGURATION (Using Compat Mode)
@@ -60,8 +66,18 @@
         const db = firebase.firestore();
         const appId = 'wet-ledger-final-build';
 
-        // Reference helper for the main ledger collection
         const getLedgerRef = () => db.collection('artifacts').doc(appId).collection('public').doc('data').collection('ledger');
+
+        // --- GLOBAL MASTER CATEGORY LIST ---
+        const MAIN_CATEGORIES = [
+            "AirBnB", "AirBnB Wrong Acct", "B.com", "Bar Stock", "Bar party", "Bartender", 
+            "Cash INCOME", "Cash advance", "Category", "CC", "CC wrong acct", "Charity", 
+            "Electric", "Event Expense", "Events", "General", "Hotel Stock", "Ice", 
+            "Improvements", "INCOME TO ACCT FOR", "Lazada", "Legal", "Loren", "LOUD", 
+            "Maintenance", "Making Change", "Online Sales", "Partner Payment", "Partner Payout", 
+            "Party", "PAYMENT TO LOREN", "Pool", "Promotion", "Refund", "Rent", "Repairs", 
+            "Restaurant Stock", "Salary", "Staff", "Transfer", "Travel", "Water", "WiFi"
+        ].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 
         // --- AUTO-CATEGORIZATION DICTIONARY ---
         const AUTO_CAT_RULES = {
@@ -108,7 +124,7 @@
             const parts = s.split(/[\/\s:-]/).filter(Boolean);
             if (parts.length < 3) return new Date(0);
             let d = parseInt(parts[0]), m = parseInt(parts[1]) - 1, y = parseInt(parts[2]);
-            if (y > 2400) y -= 543; // Thai Year Correction
+            if (y > 2400) y -= 543; 
             else if (y < 100) y += 2000;
             const h = parts[3] ? parseInt(parts[3]) : 0;
             const min = parts[4] ? parseInt(parts[4]) : 0;
@@ -127,15 +143,23 @@
             const [statusMsg, setStatusMsg] = useState(null);
             const [selected, setSelected] = useState(new Set());
             const [dbStatus, setDbStatus] = useState('connecting');
-            const [activeTab, setActiveTab] = useState('ledger'); // 'ledger' or 'reports'
+            const [activeTab, setActiveTab] = useState('ledger'); 
             
-            // Filter States
+            // Advanced Filters
             const [showFilters, setShowFilters] = useState(false);
+            const [filterMonth, setFilterMonth] = useState('');
+            const [filterType, setFilterType] = useState('All');
+            const [filterMinAmt, setFilterMinAmt] = useState('');
+            const [filterMaxAmt, setFilterMaxAmt] = useState('');
+            const [catSearchTerm, setCatSearchTerm] = useState('');
             const [excludedCats, setExcludedCats] = useState(new Set());
 
+            // Manager States
+            const [showCategoryManager, setShowCategoryManager] = useState(false);
             const [editId, setEditId] = useState(null);
             const [editForm, setEditForm] = useState({});
             const [dialog, setDialog] = useState(null);
+            const filterPanelRef = useRef(null);
 
             const lastBatchId = useMemo(() => localStorage.getItem('wet_last_batch'), [syncing]);
 
@@ -193,10 +217,29 @@
                 return () => unsub();
             }, [user]);
 
-            // Unique Categories for Filtering
-            const allCategories = useMemo(() => {
-                return [...new Set(ledger.map(tx => tx.cat || 'General'))].sort();
+            // Close filters if clicked outside
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (filterPanelRef.current && !filterPanelRef.current.contains(event.target) && !event.target.closest('.filter-btn')) {
+                        setShowFilters(false);
+                    }
+                };
+                document.addEventListener('mousedown', handleClickOutside);
+                return () => document.removeEventListener('mousedown', handleClickOutside);
+            }, []);
+
+            // Global Category Stats 
+            const allCategoryStats = useMemo(() => {
+                const stats = {};
+                ledger.forEach(tx => {
+                    const cat = tx.cat || 'General';
+                    if (!stats[cat]) stats[cat] = { count: 0 };
+                    stats[cat].count += 1;
+                });
+                return Object.entries(stats).map(([label, data]) => ({label, ...data})).sort((a,b) => b.count - a.count);
             }, [ledger]);
+
+            const allCategories = allCategoryStats.map(c => c.label);
 
             const toggleCategoryFilter = (cat) => {
                 const next = new Set(excludedCats);
@@ -204,6 +247,9 @@
                 else next.add(cat);
                 setExcludedCats(next);
             };
+
+            const selectAllCats = () => setExcludedCats(new Set());
+            const clearAllCats = () => setExcludedCats(new Set(allCategories));
 
             // --- THE ULTIMATE ROUTER & PARSER ---
             const processUltimateRaw = async (rawText, batchId) => {
@@ -410,7 +456,7 @@
 
                 localStorage.setItem('wet_last_batch', batchId);
                 setSyncing(false);
-                setStatusMsg({ type: 'success', text: `Success: Perfectly mapped & extracted ${savedCount} records.` });
+                setStatusMsg({ type: 'success', text: `Perfectly extracted ${savedCount} records.` });
                 setTimeout(() => setStatusMsg(null), 8000);
             };
 
@@ -502,6 +548,7 @@
                 if (dbStatus === 'blocked') return setStatusMsg({ type: 'error', text: "Database blocked." });
                 setDialog({
                     type: 'prompt',
+                    list: 'main-categories',
                     title: "Bulk Categorize",
                     message: `Assign a new category to the ${selected.size} selected rows:`,
                     confirmText: "Save Category",
@@ -582,12 +629,80 @@
                 }
             };
 
-            // --- DATA VIEW & FILTER LOGIC ---
+            const removeDuplicates = () => {
+                if (dbStatus === 'blocked') return setStatusMsg({ type: 'error', text: "Database blocked." });
+                setDialog({
+                    title: "Remove Duplicates",
+                    message: "Scan database and remove exact duplicate transactions? (Note: Overlapping imports are now securely overwritten by default)",
+                    confirmText: "Scan & Remove",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        setStatusMsg({ type: 'info', text: "Scanning for duplicates..." });
+
+                        const seen = new Set();
+                        const duplicates = [];
+                        const sortedLedger = [...ledger].sort((a, b) => a.ts - b.ts);
+
+                        sortedLedger.forEach(tx => {
+                            const fingerprint = `${tx.date}_${tx.amt}_${tx.type}_${tx.desc}`;
+                            if (seen.has(fingerprint)) {
+                                duplicates.push(tx.id);
+                            } else {
+                                seen.add(fingerprint);
+                            }
+                        });
+
+                        if (duplicates.length === 0) {
+                            setSyncing(false);
+                            setStatusMsg({ type: 'success', text: "No duplicates found." });
+                            setTimeout(() => setStatusMsg(null), 3000);
+                            return;
+                        }
+
+                        try {
+                            const CHUNK = 400;
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < duplicates.length; i += CHUNK) {
+                                const batch = db.batch();
+                                duplicates.slice(i, i + CHUNK).forEach(id => {
+                                    batch.delete(colRef.doc(id));
+                                });
+                                await batch.commit();
+                            }
+                            setStatusMsg({ type: 'success', text: `Removed ${duplicates.length} duplicate records.` });
+                        } catch (err) {
+                            setStatusMsg({ type: 'error', text: `Failed to remove duplicates: ${err.message}` });
+                        }
+                        setSyncing(false);
+                        setTimeout(() => setStatusMsg(null), 4000);
+                    }
+                });
+            };
+
+            // --- ADVANCED DATA FILTERING ---
             const filtered = useMemo(() => {
                 let list = ledger.filter(i => {
-                    // Exclude categories based on filter toggles
+                    // 1. Category Exclusions
                     if (excludedCats.has(i.cat || 'General')) return false;
 
+                    // 2. Month Filter
+                    if (filterMonth) {
+                        const d = normalizeDate(i.date);
+                        if (d.getFullYear() !== 1970) {
+                            const mo = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2, '0')}`;
+                            if (mo !== filterMonth) return false;
+                        }
+                    }
+
+                    // 3. Type Filter
+                    if (filterType !== 'All' && i.type !== filterType) return false;
+
+                    // 4. Amount Limits
+                    const amt = i.amt || 0;
+                    if (filterMinAmt !== '' && amt < parseFloat(filterMinAmt)) return false;
+                    if (filterMaxAmt !== '' && amt > parseFloat(filterMaxAmt)) return false;
+
+                    // 5. Text Search
                     if (searchTerm) {
                         const s = searchTerm.toLowerCase();
                         return (i.desc && i.desc.toLowerCase().includes(s)) || 
@@ -600,9 +715,10 @@
                 return list.sort((a, b) => {
                     const f = sort.dir === 'asc' ? 1 : -1;
                     if (sort.key === 'date') return (normalizeDate(a.date) - normalizeDate(b.date)) * f;
+                    if (sort.key === 'cat') return (a.cat || 'General').localeCompare(b.cat || 'General') * f;
                     return ((a[sort.key] || 0) > (b[sort.key] || 0) ? 1 : -1) * f;
                 });
-            }, [ledger, searchTerm, sort, excludedCats]);
+            }, [ledger, searchTerm, sort, excludedCats, filterMonth, filterType, filterMinAmt, filterMaxAmt]);
 
             const totals = useMemo(() => filtered.reduce((acc, i) => {
                 const amount = i.amt || 0;
@@ -610,34 +726,42 @@
                 return acc;
             }, { inc: 0, exp: 0 }), [filtered]);
 
-            // --- REPORTS LOGIC ---
+            // --- REPORTS LOGIC & CHARTS ---
             const reportStats = useMemo(() => {
                 const monthly = {};
-                const yearly = {};
+                const categories = {};
                 
                 filtered.forEach(tx => {
                     const d = normalizeDate(tx.date);
-                    if (d.getFullYear() === 1970) return; // Skip severely invalid dates
+                    if (d.getFullYear() === 1970) return; 
                     
-                    const yr = `${d.getFullYear()}`;
                     const mo = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2, '0')}`;
+                    const cat = tx.cat || 'General';
                     
                     if(!monthly[mo]) monthly[mo] = { label: mo, inc: 0, exp: 0 };
-                    if(!yearly[yr]) yearly[yr] = { label: yr, inc: 0, exp: 0 };
+                    if(!categories[cat]) categories[cat] = { inc: 0, exp: 0 };
                     
                     const amount = tx.amt || 0;
                     if (tx.type === 'Income') {
                         monthly[mo].inc += amount;
-                        yearly[yr].inc += amount;
+                        categories[cat].inc += amount;
                     } else {
                         monthly[mo].exp += amount;
-                        yearly[yr].exp += amount;
+                        categories[cat].exp += amount;
                     }
                 });
 
+                const sortedMonthly = Object.values(monthly).sort((a,b) => a.label.localeCompare(b.label)); // Chronological for chart
+                const maxMonthVal = sortedMonthly.length > 0 ? Math.max(...sortedMonthly.flatMap(m => [m.inc, m.exp])) : 1;
+
+                const sortedCats = Object.entries(categories).map(([label, data]) => ({label, ...data})).sort((a,b) => b.exp - a.exp);
+                const maxCatExp = sortedCats.length > 0 ? Math.max(...sortedCats.map(c => c.exp)) : 1;
+
                 return {
-                    monthly: Object.values(monthly).sort((a,b) => b.label.localeCompare(a.label)),
-                    yearly: Object.values(yearly).sort((a,b) => b.label.localeCompare(a.label))
+                    monthly: sortedMonthly,
+                    maxMonthVal,
+                    categories: sortedCats,
+                    maxCatExp
                 };
             }, [filtered]);
 
@@ -645,7 +769,7 @@
                 return (
                     <div className="h-screen flex flex-col items-center justify-center bg-slate-50 text-slate-900">
                         <i className="ph ph-spinner animate-spin text-blue-600 mb-4 text-4xl"></i>
-                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Initializing Live Database...</p>
+                        <p className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Connecting Database...</p>
                     </div>
                 );
             }
@@ -653,201 +777,241 @@
             return (
                 <div className="h-screen flex flex-col bg-[#fdfdfd] text-xs font-sans text-slate-900 overflow-hidden relative">
                     
-                    {/* Definitive Header */}
-                    <header className="bg-white border-b flex flex-col md:flex-row items-center justify-between px-6 py-4 md:h-20 shrink-0 z-30 shadow-sm gap-4">
-                        <div className="flex items-center gap-6 w-full md:w-auto justify-between md:justify-start">
-                            <div className="flex items-center gap-3">
-                                <div className="bg-slate-900 text-white p-2.5 rounded-xl shadow-lg">
-                                    <i className="ph ph-database text-xl"></i>
-                                </div>
-                                <div>
-                                    <div className="font-black text-slate-900 text-xl tracking-tighter leading-none">WET<span className="text-blue-600">LEDGER</span></div>
-                                    <div className="text-[9px] font-bold text-blue-500 uppercase tracking-widest mt-0.5">Dual Matrix Scanner</div>
-                                </div>
+                    <datalist id="main-categories">
+                        {MAIN_CATEGORIES.map(cat => <option key={cat} value={cat} />)}
+                    </datalist>
+
+                    {/* ULTRA DENSE HEADER */}
+                    <header className="bg-white border-b flex flex-col md:flex-row items-center justify-between px-4 py-2 md:h-14 shrink-0 z-30 shadow-sm gap-2">
+                        
+                        {/* 1. Logo (Left) */}
+                        <div className="flex items-center gap-2 w-full md:w-[200px]">
+                            <div className="bg-slate-900 text-white p-1.5 rounded-lg shadow-sm">
+                                <i className="ph ph-database text-lg"></i>
+                            </div>
+                            <div className="leading-none">
+                                <div className="font-black text-slate-900 text-base tracking-tight">WET<span className="text-blue-600">LEDGER</span></div>
+                                <div className="text-[8px] font-bold text-slate-400 uppercase tracking-widest mt-0.5">Density Build</div>
                             </div>
                         </div>
 
-                        <div className="flex flex-wrap items-center gap-3 md:gap-5 w-full md:w-auto justify-center md:justify-end">
-                            
-                            {/* Navigation Tabs */}
-                            <div className="flex bg-slate-100 p-1 rounded-xl shadow-inner mr-2">
-                                <button onClick={() => setActiveTab('ledger')} className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${activeTab === 'ledger' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
-                                    <i className="ph ph-list-dashes text-sm"></i> Ledger
-                                </button>
-                                <button onClick={() => setActiveTab('reports')} className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${activeTab === 'reports' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
-                                    <i className="ph ph-chart-bar text-sm"></i> Reports
-                                </button>
-                            </div>
-
-                            {/* Search & Filter Trigger */}
+                        {/* 2. Tools & Search (Center) */}
+                        <div className="flex flex-1 flex-wrap items-center justify-center gap-1.5 w-full">
                             {activeTab === 'ledger' && (
-                                <div className="relative flex gap-2 w-full md:w-auto">
-                                    <div className="relative flex-1 md:w-64">
-                                        <i className="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-base"></i>
+                                <>
+                                    <div className="relative w-full max-w-[200px]">
+                                        <i className="ph ph-magnifying-glass absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
                                         <input 
-                                            className="pl-9 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl w-full outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all shadow-inner font-medium text-xs" 
-                                            placeholder="Search records..." 
+                                            className="pl-7 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md w-full outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white transition-all shadow-inner font-medium text-[11px]" 
+                                            placeholder="Search ledger..." 
                                             value={searchTerm} 
                                             onChange={e => setSearchTerm(e.target.value)} 
                                         />
                                     </div>
-                                    <button 
-                                        onClick={() => setShowFilters(!showFilters)} 
-                                        className={`px-3 py-2 border rounded-xl flex items-center gap-1 transition-all ${showFilters || excludedCats.size > 0 ? 'bg-blue-50 border-blue-200 text-blue-600 shadow-inner' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
-                                        title="Filter Categories"
-                                    >
-                                        <i className="ph ph-funnel text-base"></i>
-                                        {excludedCats.size > 0 && <span className="bg-blue-600 text-white text-[9px] font-bold px-1.5 rounded-full">{excludedCats.size}</span>}
-                                    </button>
-                                </div>
-                            )}
 
-                            {/* Utility Buttons */}
-                            {activeTab === 'ledger' && (
-                                <div className="flex gap-2">
-                                    <label className="bg-blue-600 text-white px-5 py-2.5 rounded-xl font-black cursor-pointer hover:bg-blue-700 transition-all flex items-center gap-2 text-[10px] uppercase shadow-lg active:scale-95">
-                                        <i className="ph ph-file-text text-base"></i> IMPORT
+                                    {/* Advanced Filter Button */}
+                                    <div className="relative" ref={filterPanelRef}>
+                                        <button 
+                                            onClick={() => setShowFilters(!showFilters)} 
+                                            className={`px-2.5 py-1.5 border rounded-md flex items-center gap-1 text-[10px] font-bold transition-all filter-btn ${showFilters || excludedCats.size > 0 || filterMonth || filterType !== 'All' ? 'bg-blue-50 border-blue-200 text-blue-600 shadow-inner' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
+                                            title="Advanced Filters"
+                                        >
+                                            <i className="ph ph-funnel text-sm"></i> Filters
+                                            {(excludedCats.size > 0 || filterMonth || filterType !== 'All') && <span className="bg-blue-600 text-white text-[8px] px-1 rounded-full">!</span>}
+                                        </button>
+
+                                        {/* Filter Dropdown Panel */}
+                                        {showFilters && (
+                                            <div className="absolute top-full left-0 md:left-1/2 md:-translate-x-1/2 mt-2 w-[320px] bg-white border border-slate-200 shadow-2xl rounded-xl p-4 z-50 animate-in slide-in-from-top-2">
+                                                <div className="grid grid-cols-2 gap-3 mb-3 pb-3 border-b border-slate-100">
+                                                    <div>
+                                                        <label className="block text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Month</label>
+                                                        <input type="month" value={filterMonth} onChange={e => setFilterMonth(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400"/>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Type</label>
+                                                        <select value={filterType} onChange={e => setFilterType(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400">
+                                                            <option value="All">All Transactions</option>
+                                                            <option value="Income">Income Only</option>
+                                                            <option value="Expense">Expense Only</option>
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Min ฿</label>
+                                                        <input type="number" placeholder="0" value={filterMinAmt} onChange={e => setFilterMinAmt(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400"/>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Max ฿</label>
+                                                        <input type="number" placeholder="Any" value={filterMaxAmt} onChange={e => setFilterMaxAmt(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400"/>
+                                                    </div>
+                                                </div>
+
+                                                <div className="flex justify-between items-end mb-2">
+                                                    <label className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">Categories</label>
+                                                    <div className="text-[9px] font-bold">
+                                                        <button onClick={selectAllCats} className="text-blue-600 hover:underline">All</button>
+                                                        <span className="text-slate-300 mx-1">|</span>
+                                                        <button onClick={clearAllCats} className="text-blue-600 hover:underline">None</button>
+                                                    </div>
+                                                </div>
+                                                <input 
+                                                    type="text" placeholder="Search categories to filter..." 
+                                                    value={catSearchTerm} onChange={e => setCatSearchTerm(e.target.value)}
+                                                    className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1.5 text-xs mb-2 outline-none focus:border-blue-400"
+                                                />
+                                                <div className="max-h-40 overflow-y-auto border border-slate-100 rounded-md bg-slate-50/50 p-1">
+                                                    {allCategories.filter(c => c.toLowerCase().includes(catSearchTerm.toLowerCase())).map(cat => (
+                                                        <label key={cat} className="flex items-center gap-2 p-1.5 hover:bg-slate-100 rounded cursor-pointer">
+                                                            <input 
+                                                                type="checkbox" 
+                                                                checked={!excludedCats.has(cat)} 
+                                                                onChange={() => toggleCategoryFilter(cat)}
+                                                                className="accent-blue-600 rounded"
+                                                            />
+                                                            <span className="text-xs font-medium text-slate-700 truncate">{cat}</span>
+                                                        </label>
+                                                    ))}
+                                                    {allCategories.length === 0 && <div className="text-[10px] text-slate-400 p-2 text-center">No categories found.</div>}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <button onClick={() => setShowCategoryManager(true)} className="px-2 py-1.5 border rounded-md flex items-center gap-1 bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 text-[10px] font-bold" title="Manage Categories"><i className="ph ph-folders text-sm"></i> Cats</button>
+                                    
+                                    <label className="bg-blue-600 text-white px-2.5 py-1.5 rounded-md font-bold cursor-pointer hover:bg-blue-700 transition-all flex items-center gap-1 text-[10px] shadow-sm ml-1">
+                                        <i className="ph ph-upload-simple"></i> Upload
                                         <input type="file" accept=".csv, .pdf, text/csv, application/pdf" className="hidden" onChange={handleImport} />
                                     </label>
-                                    {lastBatchId && (
-                                        <button onClick={undoLastImport} className="p-2.5 text-orange-500 hover:bg-orange-50 border border-orange-100 rounded-xl transition-all shadow-sm" title="Undo Last Batch">
-                                            <i className="ph ph-arrow-u-up-left text-lg"></i>
-                                        </button>
-                                    )}
-                                    <button onClick={() => triggerDelete(ledger.map(i => i.id))} className="p-2.5 text-slate-400 hover:text-red-600 border border-slate-200 rounded-xl transition-all shadow-sm hover:border-red-200 hover:bg-red-50" title="Wipe Database">
-                                        <i className="ph ph-eraser text-lg"></i>
-                                    </button>
-                                </div>
+                                </>
                             )}
+                        </div>
+
+                        {/* 3. Tabs (Right) */}
+                        <div className="flex items-center justify-end w-full md:w-[200px]">
+                            <div className="flex bg-slate-100 p-0.5 rounded-lg shadow-inner">
+                                <button onClick={() => setActiveTab('ledger')} className={`px-3 py-1 rounded-md text-[9px] font-black uppercase tracking-wider transition-all flex items-center gap-1 ${activeTab === 'ledger' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                                    <i className="ph ph-table"></i> Ledger
+                                </button>
+                                <button onClick={() => setActiveTab('reports')} className={`px-3 py-1 rounded-md text-[9px] font-black uppercase tracking-wider transition-all flex items-center gap-1 ${activeTab === 'reports' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                                    <i className="ph ph-chart-line-up"></i> Reports
+                                </button>
+                            </div>
                         </div>
                     </header>
 
-                    {/* Filter Panel (Dropdown) */}
-                    {showFilters && activeTab === 'ledger' && (
-                        <div className="bg-slate-50 border-b border-slate-200 px-6 py-3 flex flex-wrap items-center gap-2 z-20 shadow-inner animate-in slide-in-from-top-2">
-                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest mr-2">Exclude Categories:</span>
-                            {allCategories.map(cat => (
-                                <button 
-                                    key={cat}
-                                    onClick={() => toggleCategoryFilter(cat)}
-                                    className={`px-3 py-1 rounded-full text-[10px] font-bold border transition-colors flex items-center gap-1 ${excludedCats.has(cat) ? 'bg-slate-200 border-slate-300 text-slate-500 opacity-60 line-through' : 'bg-white border-blue-200 text-blue-700 shadow-sm'}`}
-                                >
-                                    {excludedCats.has(cat) ? <i className="ph ph-x"></i> : <i className="ph ph-check"></i>}
-                                    {cat}
-                                </button>
-                            ))}
-                            {excludedCats.size > 0 && (
-                                <button onClick={() => setExcludedCats(new Set())} className="ml-auto text-[10px] font-bold text-blue-600 hover:underline">Clear Filters</button>
-                            )}
-                        </div>
-                    )}
-
                     {/* Status Alerts */}
                     {statusMsg && (
-                        <div className={`absolute top-24 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-5 py-3 rounded-xl text-[11px] font-bold shadow-2xl animate-in fade-in slide-in-from-top-4 duration-300 ${statusMsg.type === 'error' ? 'bg-red-600 text-white' : 'bg-emerald-600 text-white'}`}>
-                            {statusMsg.type === 'error' ? <i className="ph ph-warning text-lg"></i> : <i className="ph ph-check-circle text-lg"></i>}
+                        <div className={`absolute top-16 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 rounded-lg text-[10px] font-bold shadow-xl animate-in fade-in slide-in-from-top-2 duration-300 ${statusMsg.type === 'error' ? 'bg-red-600 text-white' : 'bg-emerald-600 text-white'}`}>
+                            {statusMsg.type === 'error' ? <i className="ph ph-warning text-sm"></i> : <i className="ph ph-check-circle text-sm"></i>}
                             {statusMsg.text}
                         </div>
                     )}
 
-                    {/* Accuracy Banner */}
+                    {/* Banner: Ultra-Dense */}
                     <div className="grid grid-cols-2 md:grid-cols-4 border-b bg-white divide-x divide-y md:divide-y-0 divide-slate-100 shrink-0 z-10 shadow-sm">
-                        <div className="p-4 md:p-5 bg-emerald-50/20">
-                            <div className="flex items-center gap-2 mb-1">
-                                <div className="p-1.5 bg-emerald-100 rounded-lg text-emerald-600"><i className="ph ph-arrow-up-right text-sm"></i></div>
-                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em]">Filtered Income</p>
+                        <div className="p-2 md:p-3 bg-emerald-50/20">
+                            <div className="flex items-center gap-1 mb-0.5">
+                                <div className="text-emerald-600"><i className="ph ph-arrow-up-right text-xs"></i></div>
+                                <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Income</p>
                             </div>
-                            <p className="text-xl md:text-3xl font-black text-emerald-600 tracking-tight">฿{totals.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                            <p className="text-lg md:text-xl font-black text-emerald-600 tracking-tight">฿{totals.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
                         </div>
                         
-                        <div className="p-4 md:p-5 bg-rose-50/20">
-                            <div className="flex items-center gap-2 mb-1">
-                                <div className="p-1.5 bg-rose-100 rounded-lg text-rose-600"><i className="ph ph-arrow-down-left text-sm"></i></div>
-                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em]">Filtered Expense</p>
+                        <div className="p-2 md:p-3 bg-rose-50/20">
+                            <div className="flex items-center gap-1 mb-0.5">
+                                <div className="text-rose-600"><i className="ph ph-arrow-down-left text-xs"></i></div>
+                                <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Expense</p>
                             </div>
-                            <p className="text-xl md:text-3xl font-black text-rose-600 tracking-tight">฿{totals.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                            <p className="text-lg md:text-xl font-black text-rose-600 tracking-tight">฿{totals.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
                         </div>
 
-                        <div className="p-4 md:p-5 bg-blue-50/20">
-                            <div className="flex items-center gap-2 mb-1">
-                                <div className="p-1.5 bg-blue-100 rounded-lg text-blue-600"><i className="ph ph-wallet text-sm"></i></div>
-                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em]">Filtered Net</p>
+                        <div className="p-2 md:p-3 bg-blue-50/20">
+                            <div className="flex items-center gap-1 mb-0.5">
+                                <div className="text-blue-600"><i className="ph ph-wallet text-xs"></i></div>
+                                <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Net</p>
                             </div>
-                            <p className={`text-xl md:text-3xl font-black tracking-tight ${totals.inc - totals.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>฿{(totals.inc - totals.exp).toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                            <p className={`text-lg md:text-xl font-black tracking-tight ${totals.inc - totals.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>฿{(totals.inc - totals.exp).toLocaleString(undefined, {minimumFractionDigits:2})}</p>
                         </div>
 
-                        <div className="p-4 md:p-5 flex flex-col justify-center items-end bg-slate-50/50">
-                            {selected.size > 0 && activeTab === 'ledger' ? (
-                                <div className="flex gap-2 w-full h-full">
-                                    <button onClick={bulkCategorize} className="flex-1 bg-slate-900 text-white rounded-xl font-black uppercase text-[10px] shadow-xl hover:bg-black flex items-center justify-center gap-1.5 transition-colors"><i className="ph ph-tag text-base"></i> Tag</button>
-                                    <button onClick={() => triggerDelete(Array.from(selected))} className="flex-1 bg-red-600 text-white rounded-xl font-black uppercase text-[10px] shadow-xl hover:bg-red-700 flex items-center justify-center gap-1.5 transition-colors"><i className="ph ph-trash text-base"></i> Del</button>
-                                </div>
-                            ) : (
-                                <div className="flex flex-col items-end gap-2 w-full">
-                                    {activeTab === 'ledger' && (
-                                        <button onClick={applyRulesToExisting} className="w-full bg-indigo-100 text-indigo-700 px-3 py-2 rounded-xl font-black uppercase text-[10px] flex items-center justify-center gap-1.5 hover:bg-indigo-200 transition-colors shadow-sm" title="Scan database and apply category rules">
-                                            <i className="ph ph-magic-wand text-base"></i> Auto-Tag DB
-                                        </button>
-                                    )}
-                                    <div className="flex items-center gap-1.5 text-[10px] font-bold text-blue-600 uppercase tracking-widest mt-1">
-                                        <i className="ph ph-check-circle text-sm"></i> {excludedCats.size > 0 ? 'Filters Active' : 'Live Data Ready'}
-                                    </div>
-                                </div>
-                            )}
+                        <div className="p-2 md:p-3 flex flex-col justify-center items-end bg-slate-50/50">
+                            <div className="flex flex-wrap justify-end gap-1.5 w-full">
+                                {selected.size > 0 && activeTab === 'ledger' ? (
+                                    <>
+                                        <button onClick={bulkCategorize} className="flex-1 bg-slate-900 text-white rounded-md font-black uppercase text-[9px] py-1 shadow-sm hover:bg-black flex items-center justify-center gap-1"><i className="ph ph-tag"></i> Tag</button>
+                                        <button onClick={() => triggerDelete(Array.from(selected))} className="flex-1 bg-red-600 text-white rounded-md font-black uppercase text-[9px] py-1 shadow-sm hover:bg-red-700 flex items-center justify-center gap-1"><i className="ph ph-trash"></i> Del</button>
+                                    </>
+                                ) : (
+                                    <>
+                                        {activeTab === 'ledger' && (
+                                            <>
+                                                <button onClick={removeDuplicates} className="flex-1 bg-amber-100 text-amber-700 px-2 py-1 rounded-md font-black uppercase text-[9px] flex items-center justify-center gap-1 hover:bg-amber-200" title="Deduplicate"><i className="ph ph-copy"></i> Dedup</button>
+                                                <button onClick={applyRulesToExisting} className="flex-1 bg-indigo-100 text-indigo-700 px-2 py-1 rounded-md font-black uppercase text-[9px] flex items-center justify-center gap-1 hover:bg-indigo-200" title="Auto-Tag"><i className="ph ph-magic-wand"></i> Auto-Tag</button>
+                                            </>
+                                        )}
+                                        {activeTab === 'ledger' && <button onClick={() => triggerDelete(ledger.map(i => i.id))} className="bg-red-100 text-red-600 px-2 py-1 rounded-md font-black uppercase text-[9px] flex items-center justify-center hover:bg-red-200" title="Wipe Database"><i className="ph ph-eraser"></i></button>}
+                                    </>
+                                )}
+                            </div>
                         </div>
                     </div>
 
                     {/* MAIN CONTENT AREA */}
                     <main className="flex-1 overflow-y-auto overflow-x-hidden bg-white relative">
                         
-                        {/* TAB: LEDGER */}
+                        {/* TAB: LEDGER (Ultra-Dense) */}
                         {activeTab === 'ledger' && (
                             <div className="w-full overflow-x-auto block">
                                 <table className="w-full min-w-[800px] text-left border-collapse table-fixed">
-                                    <thead className="sticky top-0 bg-slate-50 z-20 border-b shadow-sm">
-                                        <tr className="text-slate-500 font-black uppercase text-[9px] tracking-[0.15em]">
-                                            <th className="p-3 md:p-4 w-12 text-center border-r border-slate-100">
+                                    <thead className="sticky top-0 bg-slate-100 z-20 border-b border-slate-200 shadow-sm">
+                                        <tr className="text-slate-500 font-black uppercase text-[9px] tracking-widest">
+                                            <th className="px-2 py-1.5 w-10 text-center border-r border-slate-200">
                                                 <button onClick={() => {
                                                     if (selected.size === filtered.length && filtered.length > 0) setSelected(new Set());
                                                     else setSelected(new Set(filtered.map(i => i.id)));
                                                 }}>
-                                                    {selected.size > 0 && selected.size === filtered.length ? <i className="ph ph-check-square text-lg text-blue-600"></i> : <i className="ph ph-square text-lg"></i>}
+                                                    {selected.size > 0 && selected.size === filtered.length ? <i className="ph ph-check-square text-base text-blue-600"></i> : <i className="ph ph-square text-base"></i>}
                                                 </button>
                                             </th>
-                                            <th className="p-3 md:p-4 w-32 cursor-pointer hover:text-blue-600 transition-colors border-r border-slate-100" onClick={() => setSort({key:'date', dir: sort.dir==='asc'?'desc':'asc'})}>Date / Time</th>
-                                            <th className="p-3 md:p-4 w-24 border-r border-slate-100">Type</th>
-                                            <th className="p-3 md:p-4 text-right w-32 cursor-pointer hover:text-blue-600 border-r border-slate-100" onClick={() => setSort({key:'amt', dir: sort.dir==='asc'?'desc':'asc'})}>Amount</th>
-                                            <th className="p-3 md:p-4 border-r border-slate-100">Description</th>
-                                            <th className="p-3 md:p-4 w-32 border-r border-slate-100">Category</th>
-                                            <th className="p-3 md:p-4 w-16"></th>
+                                            <th className="px-3 py-1.5 w-28 cursor-pointer hover:text-blue-600 transition-colors border-r border-slate-200" onClick={() => setSort({key:'date', dir: sort.dir==='asc'?'desc':'asc'})}>Date/Time</th>
+                                            <th className="px-2 py-1.5 w-16 border-r border-slate-200 text-center">Type</th>
+                                            <th className="px-3 py-1.5 text-right w-24 cursor-pointer hover:text-blue-600 border-r border-slate-200" onClick={() => setSort({key:'amt', dir: sort.dir==='asc'?'desc':'asc'})}>Amount</th>
+                                            <th className="px-3 py-1.5 border-r border-slate-200">Description & Notes</th>
+                                            <th className="px-3 py-1.5 w-36 cursor-pointer hover:text-blue-600 border-r border-slate-200" onClick={() => setSort({key:'cat', dir: sort.dir==='asc'?'desc':'asc'})}>Category</th>
+                                            <th className="px-2 py-1.5 w-10"></th>
                                         </tr>
                                     </thead>
-                                    <tbody className="divide-y divide-slate-100 text-[11px]">
+                                    <tbody className="divide-y divide-slate-100 text-[10px] md:text-[11px]">
                                         {filtered.map(item => (
-                                            <tr key={item.id} className={`hover:bg-blue-50/40 transition-all group ${selected.has(item.id) ? 'bg-blue-50/60' : ''}`}>
-                                                <td className="p-3 md:p-4 text-center border-r border-slate-50">
+                                            <tr key={item.id} className={`hover:bg-blue-50/40 transition-colors group h-8 ${selected.has(item.id) ? 'bg-blue-50/60' : ''}`}>
+                                                <td className="px-2 py-1 text-center border-r border-slate-50">
                                                     <button onClick={() => {
                                                         const next = new Set(selected);
                                                         if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
                                                         setSelected(next);
                                                     }}>
-                                                        {selected.has(item.id) ? <i className="ph ph-check-square text-lg text-blue-600"></i> : <i className="ph ph-square text-lg text-slate-200 group-hover:text-slate-400"></i>}
+                                                        {selected.has(item.id) ? <i className="ph ph-check-square text-[14px] text-blue-600"></i> : <i className="ph ph-square text-[14px] text-slate-200 group-hover:text-slate-400"></i>}
                                                     </button>
                                                 </td>
-                                                <td className="p-3 md:p-4 font-mono text-slate-500 leading-tight border-r border-slate-50">{item.date}</td>
-                                                <td className="p-3 md:p-4 border-r border-slate-50">
-                                                    <span className={`px-2 py-1 rounded-md text-[9px] font-black uppercase tracking-widest shadow-sm ${item.type === 'Income' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>{item.type}</span>
+                                                <td className="px-3 py-1 font-mono text-[10px] text-slate-500 whitespace-nowrap border-r border-slate-50">{item.date}</td>
+                                                <td className="px-2 py-1 border-r border-slate-50 text-center">
+                                                    <span className={`px-1 rounded text-[8px] font-black uppercase tracking-wider ${item.type === 'Income' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                        {item.type === 'Income' ? 'INC' : 'EXP'}
+                                                    </span>
                                                 </td>
-                                                <td className={`p-3 md:p-4 text-right font-black text-sm border-r border-slate-50 ${item.type === 'Income' ? 'text-emerald-600' : 'text-rose-600'}`}>฿{(item.amt || 0).toLocaleString(undefined, {minimumFractionDigits:2})}</td>
-                                                <td className="p-3 md:p-4 align-top border-r border-slate-50 whitespace-normal">
-                                                    <p className="font-bold text-slate-800 leading-snug">{item.desc}</p>
-                                                    {item.note && <p className="text-[10px] text-slate-400 mt-1 italic leading-tight">{item.note}</p>}
+                                                <td className={`px-3 py-1 text-right font-bold whitespace-nowrap border-r border-slate-50 ${item.type === 'Income' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                    ฿{(item.amt || 0).toLocaleString(undefined, {minimumFractionDigits:2})}
                                                 </td>
-                                                <td className="p-3 md:p-4 border-r border-slate-50 whitespace-normal">
-                                                    <span className="bg-slate-100 border border-slate-200 px-2 py-1 rounded text-[9px] text-slate-500 font-bold uppercase truncate block text-center">{item.cat || 'General'}</span>
+                                                <td className="px-3 py-1 border-r border-slate-50 overflow-hidden relative" title={`${item.desc} ${item.note ? `| ${item.note}` : ''}`}>
+                                                    <div className="font-medium text-slate-800 truncate whitespace-nowrap">
+                                                        {item.desc} {item.note && <span className="text-slate-400 italic">| {item.note}</span>}
+                                                    </div>
                                                 </td>
-                                                <td className="p-3 md:p-4 opacity-0 group-hover:opacity-100 text-right space-x-2">
-                                                    <button onClick={() => {setEditId(item.id); setEditForm({...item})}} className="text-slate-300 hover:text-blue-600 transition-colors"><i className="ph ph-pencil-simple text-lg"></i></button>
+                                                <td className="px-3 py-1 border-r border-slate-50 overflow-hidden">
+                                                    <span className="bg-slate-100 px-1.5 py-0.5 rounded text-[9px] text-slate-600 font-bold uppercase truncate block w-full">{item.cat || 'General'}</span>
+                                                </td>
+                                                <td className="px-2 py-1 text-center opacity-0 group-hover:opacity-100">
+                                                    <button onClick={() => {setEditId(item.id); setEditForm({...item})}} className="text-slate-400 hover:text-blue-600 transition-colors"><i className="ph ph-pencil-simple text-sm"></i></button>
                                                 </td>
                                             </tr>
                                         ))}
@@ -855,72 +1019,113 @@
                                 </table>
                                 
                                 {filtered.length === 0 && !syncing && (
-                                    <div className="py-40 text-center flex flex-col items-center gap-4 text-slate-300">
-                                        <i className="ph ph-cloud text-6xl"></i>
-                                        <div className="space-y-2">
-                                            <p className="font-black uppercase tracking-[0.4em] text-sm text-slate-400">No Data Found</p>
-                                            <p className="text-xs font-medium opacity-60 max-w-sm mx-auto leading-relaxed">Upload CSVs or drop raw Bank Statement PDFs. Try clearing filters if applied.</p>
+                                    <div className="py-20 text-center flex flex-col items-center gap-3 text-slate-300">
+                                        <i className="ph ph-cloud text-5xl"></i>
+                                        <div className="space-y-1">
+                                            <p className="font-black uppercase tracking-[0.3em] text-xs text-slate-400">No Data Found</p>
                                         </div>
                                     </div>
                                 )}
                             </div>
                         )}
 
-                        {/* TAB: REPORTS */}
+                        {/* TAB: REPORTS (With Visual Charts) */}
                         {activeTab === 'reports' && (
-                            <div className="p-6 md:p-10 max-w-5xl mx-auto space-y-12">
-                                <div>
-                                    <h2 className="text-xl font-black text-slate-800 uppercase tracking-widest mb-6 flex items-center gap-2"><i className="ph ph-calendar-blank text-blue-600"></i> Monthly Breakdown</h2>
-                                    <div className="bg-white rounded-2xl border shadow-sm overflow-hidden">
-                                        <table className="w-full text-left border-collapse">
-                                            <thead className="bg-slate-50 border-b">
-                                                <tr className="text-slate-500 font-black uppercase text-[10px] tracking-widest">
-                                                    <th className="p-4 border-r border-slate-100">Month</th>
-                                                    <th className="p-4 text-right border-r border-slate-100">Income</th>
-                                                    <th className="p-4 text-right border-r border-slate-100">Expense</th>
-                                                    <th className="p-4 text-right bg-slate-100/50">Net Profit</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody className="divide-y divide-slate-100 text-sm">
-                                                {reportStats.monthly.map(stat => (
-                                                    <tr key={stat.label} className="hover:bg-slate-50 transition-colors">
-                                                        <td className="p-4 font-black text-slate-700 border-r border-slate-50">{stat.label}</td>
-                                                        <td className="p-4 text-right font-bold text-emerald-600 border-r border-slate-50">฿{stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
-                                                        <td className="p-4 text-right font-bold text-rose-600 border-r border-slate-50">฿{stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
-                                                        <td className={`p-4 text-right font-black bg-slate-50/50 ${stat.inc - stat.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>
-                                                            ฿{(stat.inc - stat.exp).toLocaleString(undefined, {minimumFractionDigits:2})}
-                                                        </td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
+                            <div className="p-4 md:p-6 max-w-6xl mx-auto space-y-6">
+                                
+                                {/* Top Summary Charts */}
+                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                    {/* Monthly Trend Chart */}
+                                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+                                        <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><i className="ph ph-chart-bar text-blue-600"></i> Monthly Trend</h2>
+                                        <div className="h-40 flex items-end gap-2 overflow-x-auto pb-2 border-b border-slate-100">
+                                            {reportStats.monthly.map((stat, i) => (
+                                                <div key={stat.label} className="flex flex-col justify-end items-center gap-1 flex-1 min-w-[30px]" title={`${stat.label}: Inc ฿${stat.inc} | Exp ฿${stat.exp}`}>
+                                                    <div className="flex gap-0.5 items-end h-32 w-full justify-center">
+                                                        <div style={{height: `${(stat.inc/reportStats.maxMonthVal)*100}%`}} className="w-1.5 md:w-3 bg-emerald-400 rounded-t-sm animate-grow-up"></div>
+                                                        <div style={{height: `${(stat.exp/reportStats.maxMonthVal)*100}%`}} className="w-1.5 md:w-3 bg-rose-400 rounded-t-sm animate-grow-up" style={{animationDelay: '0.1s'}}></div>
+                                                    </div>
+                                                    <span className="text-[8px] font-bold text-slate-400 -rotate-45 origin-top-left mt-2">{stat.label.split('-')[1]}/{stat.label.split('-')[0].substring(2)}</span>
+                                                </div>
+                                            ))}
+                                            {reportStats.monthly.length === 0 && <div className="w-full h-full flex items-center justify-center text-slate-300 text-xs">No data to chart</div>}
+                                        </div>
+                                    </div>
+
+                                    {/* Top Expenses by Category Chart */}
+                                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+                                        <h2 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><i className="ph ph-chart-pie-slice text-blue-600"></i> Top Expenses by Category</h2>
+                                        <div className="h-40 overflow-y-auto space-y-3 pr-2">
+                                            {reportStats.categories.slice(0, 8).map((cat, i) => (
+                                                <div key={cat.label} className="flex items-center gap-2 text-[10px]">
+                                                    <div className="w-24 truncate font-bold text-slate-600" title={cat.label}>{cat.label}</div>
+                                                    <div className="flex-1 bg-slate-100 h-2 rounded-full overflow-hidden">
+                                                        <div style={{width: `${(cat.exp/reportStats.maxCatExp)*100}%`, animationDelay: `${i*0.05}s`}} className="bg-rose-400 h-full rounded-full animate-grow-right"></div>
+                                                    </div>
+                                                    <div className="w-16 text-right font-mono text-slate-500">฿{cat.exp.toLocaleString(undefined, {maximumFractionDigits:0})}</div>
+                                                </div>
+                                            ))}
+                                            {reportStats.categories.length === 0 && <div className="w-full h-full flex items-center justify-center text-slate-300 text-xs">No data to chart</div>}
+                                        </div>
                                     </div>
                                 </div>
 
-                                <div>
-                                    <h2 className="text-xl font-black text-slate-800 uppercase tracking-widest mb-6 flex items-center gap-2"><i className="ph ph-calendar text-blue-600"></i> Yearly Breakdown</h2>
-                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                                        {reportStats.yearly.map(stat => (
-                                            <div key={stat.label} className="bg-white rounded-2xl border shadow-sm p-6 flex flex-col justify-between">
-                                                <h3 className="text-3xl font-black text-slate-800 mb-6">{stat.label}</h3>
-                                                <div className="space-y-4">
-                                                    <div className="flex justify-between items-center pb-3 border-b border-slate-100">
-                                                        <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Income</span>
-                                                        <span className="font-bold text-emerald-600">฿{stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
-                                                    </div>
-                                                    <div className="flex justify-between items-center pb-3 border-b border-slate-100">
-                                                        <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Expense</span>
-                                                        <span className="font-bold text-rose-600">฿{stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</span>
-                                                    </div>
-                                                    <div className="flex justify-between items-center pt-2">
-                                                        <span className="text-[11px] font-black text-slate-900 uppercase tracking-widest">Net Profit</span>
-                                                        <span className={`text-xl font-black ${stat.inc - stat.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>
-                                                            ฿{(stat.inc - stat.exp).toLocaleString(undefined, {minimumFractionDigits:2})}
-                                                        </span>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        ))}
+                                {/* Raw Data Tables */}
+                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                    <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
+                                        <div className="bg-slate-50 p-2 border-b border-slate-100">
+                                            <h2 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Monthly Data</h2>
+                                        </div>
+                                        <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                                            <table className="w-full text-left border-collapse text-[10px]">
+                                                <thead className="bg-white sticky top-0 border-b">
+                                                    <tr className="text-slate-400 font-bold uppercase tracking-wider">
+                                                        <th className="px-3 py-2">Month</th>
+                                                        <th className="px-3 py-2 text-right">Income</th>
+                                                        <th className="px-3 py-2 text-right">Expense</th>
+                                                        <th className="px-3 py-2 text-right">Net</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {reportStats.monthly.map(stat => (
+                                                        <tr key={stat.label} className="hover:bg-slate-50">
+                                                            <td className="px-3 py-1.5 font-bold text-slate-600">{stat.label}</td>
+                                                            <td className="px-3 py-1.5 text-right font-medium text-emerald-600">฿{stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                            <td className="px-3 py-1.5 text-right font-medium text-rose-600">฿{stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                            <td className={`px-3 py-1.5 text-right font-black ${stat.inc - stat.exp >= 0 ? 'text-blue-600' : 'text-orange-600'}`}>
+                                                                ฿{(stat.inc - stat.exp).toLocaleString(undefined, {minimumFractionDigits:2})}
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
+                                        <div className="bg-slate-50 p-2 border-b border-slate-100">
+                                            <h2 className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Category Totals</h2>
+                                        </div>
+                                        <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
+                                            <table className="w-full text-left border-collapse text-[10px]">
+                                                <thead className="bg-white sticky top-0 border-b">
+                                                    <tr className="text-slate-400 font-bold uppercase tracking-wider">
+                                                        <th className="px-3 py-2">Category</th>
+                                                        <th className="px-3 py-2 text-right">Income</th>
+                                                        <th className="px-3 py-2 text-right">Expense</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {reportStats.categories.map(stat => (
+                                                        <tr key={stat.label} className="hover:bg-slate-50">
+                                                            <td className="px-3 py-1.5 font-bold text-slate-600 truncate max-w-[120px]" title={stat.label}>{stat.label}</td>
+                                                            <td className="px-3 py-1.5 text-right font-medium text-emerald-600">{stat.inc > 0 ? `฿${stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}` : '-'}</td>
+                                                            <td className="px-3 py-1.5 text-right font-medium text-rose-600">{stat.exp > 0 ? `฿${stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}` : '-'}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -928,54 +1133,158 @@
                     </main>
 
                     {/* Global Status Footer */}
-                    <footer className="bg-white border-t flex flex-col md:flex-row items-center justify-between px-6 py-2 md:h-10 shrink-0 z-30 shadow-2xl gap-2">
-                        <div className="flex items-center gap-4 md:gap-6">
-                            <div className="flex items-center gap-2">
-                                {dbStatus === 'blocked' ? <i className="ph ph-plugs text-red-500"></i> : <div className={`w-2 h-2 rounded-full ${user && dbStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`}></div>}
-                                <span className={`text-[9px] font-black uppercase tracking-[0.2em] ${dbStatus === 'blocked' ? 'text-red-500' : 'text-slate-500'}`}>{dbStatus === 'blocked' ? 'DB BLOCKED (CHECK RULES)' : user ? 'Live Firebase Stable' : 'Sync Offline'}</span>
+                    <footer className="bg-white border-t flex flex-col md:flex-row items-center justify-between px-3 py-1 md:h-6 shrink-0 z-30 shadow-2xl gap-1">
+                        <div className="flex items-center gap-4 w-full md:w-auto justify-between md:justify-start">
+                            <div className="flex items-center gap-1.5">
+                                {dbStatus === 'blocked' ? <i className="ph ph-warning-circle text-red-500 text-[10px]"></i> : <div className={`w-1.5 h-1.5 rounded-full ${user && dbStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`}></div>}
+                                <span className={`text-[8px] font-black uppercase tracking-widest ${dbStatus === 'blocked' ? 'text-red-500' : 'text-slate-500'}`}>{dbStatus === 'blocked' ? 'DB BLOCKED' : user ? 'Stable' : 'Offline'}</span>
                             </div>
-                            <div className="hidden md:block h-4 w-px bg-slate-200"></div>
-                            <span className="hidden md:inline text-[9px] text-slate-400 font-bold uppercase tracking-widest">Path: /artifacts/{appId}/public/data/ledger</span>
-                        </div>
-                        <div className="flex items-center gap-4">
-                            {syncing && <div className="flex items-center gap-2 text-blue-600 font-black text-[9px] animate-pulse"><i className="ph ph-arrows-clockwise animate-spin text-sm"></i> SYNCING TO CLOUD</div>}
-                            <div className="hidden md:block h-4 w-px bg-slate-200"></div>
-                            <span className="text-[10px] text-slate-900 font-black tracking-tighter uppercase">Cloud Records: {ledger.length.toLocaleString()}</span>
+                            <span className="text-[8px] text-slate-400 font-bold uppercase tracking-widest hidden md:inline">Path: /artifacts/{appId}/public/data/ledger</span>
+                            <div className="flex items-center gap-2 md:ml-auto">
+                                {syncing && <span className="text-blue-600 font-black text-[8px] animate-pulse flex items-center gap-1"><i className="ph ph-arrows-clockwise animate-spin"></i> SYNC</span>}
+                                <span className="text-[8px] text-slate-900 font-black tracking-tighter uppercase">Records: {ledger.length.toLocaleString()}</span>
+                            </div>
                         </div>
                     </footer>
 
-                    {/* Edit Modal (Updated with Date Field) */}
+                    {/* CATEGORY MANAGER MODAL (Updated with "To Desc & Select" Dropdown) */}
+                    {showCategoryManager && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[110] flex items-center justify-center p-2 md:p-4 animate-in fade-in">
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl flex flex-col max-h-[90vh] animate-in zoom-in-95">
+                                <div className="flex justify-between items-center p-4 border-b bg-slate-50 rounded-t-xl">
+                                    <h3 className="font-black uppercase tracking-widest text-slate-900 text-sm flex items-center gap-2"><i className="ph ph-folders text-blue-600 text-lg"></i> Manage Categories</h3>
+                                    <button onClick={() => setShowCategoryManager(false)} className="text-slate-400 hover:text-slate-600 bg-slate-200 hover:bg-slate-300 p-1.5 rounded-md transition-colors"><i className="ph ph-x"></i></button>
+                                </div>
+                                <div className="p-0 overflow-y-auto flex-1">
+                                    <table className="w-full text-left border-collapse">
+                                        <thead className="bg-white sticky top-0 border-b z-10 shadow-sm">
+                                            <tr className="text-[9px] text-slate-400 uppercase tracking-widest">
+                                                <th className="p-3 border-r">Category Name</th>
+                                                <th className="p-3 border-r text-center w-16">Uses</th>
+                                                <th className="p-3 text-right w-48">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="text-[11px] divide-y">
+                                            {allCategoryStats.map(stat => (
+                                                <tr key={stat.label} className="hover:bg-blue-50/50 transition-colors">
+                                                    <td className="p-2 md:p-3 font-bold text-slate-700 border-r truncate max-w-[150px]">{stat.label}</td>
+                                                    <td className="p-2 md:p-3 text-slate-500 font-medium text-center border-r">{stat.count}</td>
+                                                    <td className="p-2 md:p-3 text-right flex justify-end gap-1">
+                                                        <button 
+                                                            onClick={() => {
+                                                                setDialog({
+                                                                    type: 'select',
+                                                                    options: MAIN_CATEGORIES,
+                                                                    inputValue: 'General',
+                                                                    title: 'Move to Description & Re-Categorize',
+                                                                    message: `Append text "[Cat: ${stat.label}]" to the description of all ${stat.count} items, and assign them to a new category:`,
+                                                                    confirmText: 'Move & Update',
+                                                                    onConfirm: async (selectedCat) => {
+                                                                        if (!selectedCat) return;
+                                                                        setSyncing(true);
+                                                                        try {
+                                                                            const CHUNK = 400;
+                                                                            const idsToUpdate = ledger.filter(tx => (tx.cat || 'General') === stat.label);
+                                                                            const colRef = getLedgerRef();
+                                                                            for (let i = 0; i < idsToUpdate.length; i += CHUNK) {
+                                                                                const batch = db.batch();
+                                                                                idsToUpdate.slice(i, i + CHUNK).forEach(tx => {
+                                                                                    const newDesc = `${tx.desc} [Cat: ${stat.label}]`.trim();
+                                                                                    batch.set(colRef.doc(tx.id), { cat: selectedCat, desc: newDesc }, { merge: true });
+                                                                                });
+                                                                                await batch.commit();
+                                                                            }
+                                                                            setStatusMsg({ type: 'success', text: `Moved '${stat.label}' to desc and updated ${idsToUpdate.length} items to '${selectedCat}'.` });
+                                                                        } catch (err) {
+                                                                            setStatusMsg({ type: 'error', text: `Update failed: ${err.message}` });
+                                                                        }
+                                                                        setSyncing(false);
+                                                                    }
+                                                                });
+                                                            }} 
+                                                            className="text-[9px] text-amber-600 hover:text-white font-bold bg-amber-50 hover:bg-amber-500 px-2 py-1.5 rounded-md transition-colors shadow-sm"
+                                                            title="Move category text into description and assign a new main category"
+                                                        >To Desc</button>
+                                                        <button 
+                                                            onClick={() => {
+                                                                setDialog({
+                                                                    type: 'prompt',
+                                                                    list: 'main-categories',
+                                                                    title: 'Rename / Merge Category',
+                                                                    message: `Rename all ${stat.count} items in '${stat.label}' to a new category. If the name already exists, they will merge.`,
+                                                                    inputValue: stat.label,
+                                                                    confirmText: 'Rename',
+                                                                    onConfirm: async (newCat) => {
+                                                                        if (!newCat || !newCat.trim() || stat.label === newCat.trim()) return;
+                                                                        setSyncing(true);
+                                                                        try {
+                                                                            const CHUNK = 400;
+                                                                            const idsToUpdate = ledger.filter(tx => (tx.cat || 'General') === stat.label).map(tx => tx.id);
+                                                                            const colRef = getLedgerRef();
+                                                                            for (let i = 0; i < idsToUpdate.length; i += CHUNK) {
+                                                                                const batch = db.batch();
+                                                                                idsToUpdate.slice(i, i + CHUNK).forEach(id => {
+                                                                                    batch.set(colRef.doc(id), { cat: newCat.trim() }, { merge: true });
+                                                                                });
+                                                                                await batch.commit();
+                                                                            }
+                                                                            setStatusMsg({ type: 'success', text: `Merged '${stat.label}' into '${newCat.trim()}'.` });
+                                                                        } catch (err) {
+                                                                            setStatusMsg({ type: 'error', text: `Update failed: ${err.message}` });
+                                                                        }
+                                                                        setSyncing(false);
+                                                                    }
+                                                                });
+                                                            }} 
+                                                            className="text-[9px] text-blue-600 hover:text-white font-bold bg-blue-50 hover:bg-blue-600 px-2 py-1.5 rounded-md transition-colors shadow-sm"
+                                                        >Rename</button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Edit Modal */}
                     {editId && (
                         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200">
-                            <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
-                                <div className="flex justify-between items-center border-b p-6 bg-slate-50">
-                                    <h3 className="font-black uppercase tracking-widest text-slate-900 text-lg flex items-center gap-2"><i className="ph ph-pencil-simple text-blue-600"></i> Edit Record</h3>
-                                    <button onClick={() => setEditId(null)} className="text-slate-400 hover:text-slate-600 bg-slate-200 hover:bg-slate-300 p-2 rounded-full transition-colors"><i className="ph ph-x"></i></button>
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+                                <div className="flex justify-between items-center border-b p-4 bg-slate-50">
+                                    <h3 className="font-black uppercase tracking-widest text-slate-900 text-base flex items-center gap-2"><i className="ph ph-pencil-simple text-blue-600"></i> Edit Record</h3>
+                                    <button onClick={() => setEditId(null)} className="text-slate-400 hover:text-slate-600 bg-slate-200 hover:bg-slate-300 p-1.5 rounded-md transition-colors"><i className="ph ph-x"></i></button>
                                 </div>
                                 
-                                <div className="p-6 space-y-5 overflow-y-auto max-h-[70vh]">
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                                <div className="p-5 space-y-4 overflow-y-auto max-h-[60vh]">
+                                    <div className="grid grid-cols-2 gap-4">
                                         <div className="space-y-1.5">
-                                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Date / Time (DD/MM/YY HH:MM)</label>
-                                            <input className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all" type="text" value={editForm.date || ''} onChange={e => setEditForm({...editForm, date: e.target.value})}/>
+                                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Date / Time</label>
+                                            <input className="w-full border border-slate-200 rounded-lg p-2 text-xs font-black focus:border-blue-500 outline-none transition-all shadow-inner" type="text" value={editForm.date || ''} onChange={e => setEditForm({...editForm, date: e.target.value})}/>
                                         </div>
                                         <div className="space-y-1.5">
                                             <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Amount (฿)</label>
-                                            <input className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all" type="number" step="0.01" value={editForm.amt || ''} onChange={e => setEditForm({...editForm, amt: parseCurrency(e.target.value)})}/>
+                                            <input className="w-full border border-slate-200 rounded-lg p-2 text-xs font-black focus:border-blue-500 outline-none transition-all shadow-inner" type="number" step="0.01" value={editForm.amt || ''} onChange={e => setEditForm({...editForm, amt: parseCurrency(e.target.value)})}/>
                                         </div>
                                     </div>
                                     <div className="space-y-1.5">
                                         <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Category</label>
-                                        <input className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all" value={editForm.cat || ''} onChange={e => setEditForm({...editForm, cat: e.target.value})}/>
+                                        <input 
+                                            list="main-categories"
+                                            className="w-full border border-slate-200 rounded-lg p-2 text-xs font-black focus:border-blue-500 outline-none transition-all shadow-inner bg-white" 
+                                            value={editForm.cat || ''} 
+                                            onChange={e => setEditForm({...editForm, cat: e.target.value})}
+                                        />
                                     </div>
                                     <div className="space-y-1.5">
                                         <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Description & Notes</label>
-                                        <textarea className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-medium focus:border-blue-500 outline-none transition-all" rows={4} value={editForm.desc || ''} onChange={e => setEditForm({...editForm, desc: e.target.value})}/>
+                                        <textarea className="w-full border border-slate-200 rounded-lg p-2 text-xs font-medium focus:border-blue-500 outline-none transition-all shadow-inner" rows={3} value={editForm.desc || ''} onChange={e => setEditForm({...editForm, desc: e.target.value})}/>
                                     </div>
                                 </div>
 
-                                <div className="p-6 border-t bg-slate-50 flex gap-3">
-                                    <button onClick={() => triggerDelete([editId])} className="px-6 py-4 bg-red-100 hover:bg-red-200 text-red-700 font-black rounded-xl transition-all"><i className="ph ph-trash text-lg"></i></button>
+                                <div className="p-4 border-t bg-slate-50 flex gap-2">
+                                    <button onClick={() => triggerDelete([editId])} className="px-4 py-2 bg-red-100 hover:bg-red-200 text-red-700 font-black rounded-lg transition-all shadow-sm"><i className="ph ph-trash text-base"></i></button>
                                     <button onClick={async () => {
                                         setSyncing(true);
                                         try {
@@ -985,16 +1294,15 @@
                                                 cat: editForm.cat,
                                                 desc: editForm.desc
                                             };
-                                            const colRef = getLedgerRef();
-                                            await colRef.doc(editId).set(updateData, { merge: true });
+                                            await getLedgerRef().doc(editId).set(updateData, { merge: true });
                                             setEditId(null);
-                                            setStatusMsg({ type: 'success', text: "Record updated successfully." });
+                                            setStatusMsg({ type: 'success', text: "Record updated." });
                                         } catch (e) { 
                                             setStatusMsg({ type: 'error', text: `Save failed: ${e.message}` }); 
                                         }
                                         setSyncing(false);
-                                    }} className="flex-1 bg-blue-600 text-white font-black py-4 rounded-xl shadow-lg hover:bg-blue-700 active:scale-95 transition-all uppercase tracking-widest flex justify-center items-center gap-2">
-                                        <i className="ph ph-floppy-disk text-lg"></i> Save Changes
+                                    }} className="flex-1 bg-blue-600 text-white font-black py-2 rounded-lg shadow-md hover:bg-blue-700 active:scale-95 transition-all uppercase tracking-widest flex justify-center items-center gap-1.5">
+                                        <i className="ph ph-floppy-disk text-base"></i> Save
                                     </button>
                                 </div>
                             </div>
@@ -1003,27 +1311,43 @@
 
                     {/* Global Confirmation / Prompt Modal */}
                     {dialog && (
-                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[120] flex items-center justify-center p-4 animate-in fade-in duration-200">
                             <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm space-y-4 animate-in zoom-in-95 duration-200">
-                                <h3 className="font-black uppercase tracking-widest text-slate-900 text-lg">{dialog.title}</h3>
-                                <p className="text-sm font-medium text-slate-600 leading-relaxed">{dialog.message}</p>
+                                <h3 className="font-black uppercase tracking-widest text-slate-900 text-sm">{dialog.title}</h3>
+                                <p className="text-xs font-medium text-slate-600 leading-relaxed">{dialog.message}</p>
+                                
                                 {dialog.type === 'prompt' && (
                                     <input 
                                         autoFocus 
-                                        className="w-full border-2 border-slate-200 rounded-xl p-3 text-sm font-black focus:border-blue-500 outline-none transition-all mt-2" 
+                                        list={dialog.list}
+                                        className="w-full border border-slate-200 rounded-lg p-2 text-xs font-black focus:border-blue-500 outline-none transition-all mt-2 shadow-inner bg-white" 
                                         value={dialog.inputValue || ''} 
                                         onChange={e => setDialog({...dialog, inputValue: e.target.value})} 
-                                        placeholder="Enter category name..." 
+                                        placeholder="Enter value..." 
                                     />
                                 )}
-                                <div className="flex gap-3 pt-4 border-t mt-4">
-                                    <button onClick={() => setDialog(null)} className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 rounded-xl font-bold text-slate-600 transition-colors">Cancel</button>
+
+                                {dialog.type === 'select' && (
+                                    <select 
+                                        autoFocus 
+                                        className="w-full border border-slate-200 rounded-lg p-2 text-xs font-black focus:border-blue-500 outline-none transition-all mt-2 shadow-inner bg-white" 
+                                        value={dialog.inputValue || ''} 
+                                        onChange={e => setDialog({...dialog, inputValue: e.target.value})} 
+                                    >
+                                        {dialog.options.map(opt => (
+                                            <option key={opt} value={opt}>{opt}</option>
+                                        ))}
+                                    </select>
+                                )}
+
+                                <div className="flex gap-2 pt-3 border-t mt-3">
+                                    <button onClick={() => setDialog(null)} className="flex-1 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg font-bold text-slate-600 text-xs transition-colors">Cancel</button>
                                     <button 
                                         onClick={() => { 
                                             dialog.onConfirm(dialog.inputValue); 
                                             setDialog(null); 
                                         }} 
-                                        className={`flex-1 py-3 text-white rounded-xl font-bold shadow-lg transition-all ${dialog.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
+                                        className={`flex-1 py-2 text-white rounded-lg font-bold shadow-md transition-all text-xs ${dialog.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
                                     >
                                         {dialog.confirmText || 'Confirm'}
                                     </button>
@@ -1039,5 +1363,6 @@
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
     </script>
+        <script src="https://loren-6q.github.io/WETNav/nav.js"></script>
 </body>
 </html>
