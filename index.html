@@ -6,7 +6,1543 @@
     <title>WET Ledger - Accounting System</title>
     
     <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WET Ledger - Accounting System</title>
+    
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel for in-browser JSX parsing -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- PDF.js for parsing bank statements -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    
+    <!-- Firebase v9 Compat Libraries for standalone HTML -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        /* Custom scrollbar for webkit */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        /* Bar chart animations */
+        @keyframes growUp { from { height: 0; } }
+        @keyframes growRight { from { width: 0; } }
+        .animate-grow-up { animation: growUp 0.8s ease-out forwards; }
+        .animate-grow-right { animation: growRight 0.8s ease-out forwards; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 flex flex-col min-h-screen">
+    <div id="root" class="flex-1"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect, useRef } = React;
+
+        // ==========================================
+        // 1. FIREBASE CONFIGURATION (Using Compat Mode)
+        // ==========================================
+        const firebaseConfig = {
+            apiKey: "AIzaSyCGGWOgCb9P6x4fgXw0_iAt1h5C6PcZThc",
+            authDomain: "wetaccounting.firebaseapp.com",
+            projectId: "wetaccounting",
+            storageBucket: "wetaccounting.firebasestorage.app",
+            messagingSenderId: "644990350065",
+            appId: "1:644990350065:web:156e7dd6182fc9ef566f50"
+        };
+
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const appId = 'wet-ledger-final-build';
+
+        const getLedgerRef = () => db.collection('artifacts').doc(appId).collection('public').doc('data').collection('ledger');
+
+        // --- GLOBAL MASTER CATEGORY LIST ---
+        const MAIN_CATEGORIES = [
+            "AirBnB", "AirBnB Wrong Acct", "B.com", "Bar Stock", "Bar party", "Bartender", 
+            "Cash INCOME", "Cash advance", "Category", "CC", "CC wrong acct", "Charity", 
+            "Electric", "Event Expense", "Event Tickets", "Events", "General", "Hotel Stock", "Ice", 
+            "Improvements", "INCOME TO ACCT FOR", "Lazada", "Legal", "Loren", "LOUD", 
+            "Maintenance", "Making Change", "Online Sales", "Partner Payment", "Partner Payout", 
+            "Party", "PAYMENT TO LOREN", "Pool", "Promotion", "Refund", "Rent", "Repairs", 
+            "Restaurant Stock", "Salary", "Staff", "Transfer", "Travel", "Water", "WiFi"
+        ];
+
+        // --- AUTO-CATEGORIZATION DICTIONARY ---
+        const AUTO_CAT_RULES = {
+            "100854311": "Booking.com",
+            "100885284": "Stripe / CC",
+            "x379944": "Airbnb",
+            "airbnb": "Airbnb",
+            "salary": "Payroll",
+            "salaries": "Payroll",
+            "maintenance": "Maintenance",
+            "makro": "Supplies",
+            "711": "Food & Beverage",
+            "grab": "Transport",
+            "ais": "Utilities",
+            "pea": "Utilities",
+            "provincialelectricity": "Utilities"
+        };
+
+        const applyAutoCat = (tx) => {
+            const cleanSearchStr = `${tx.desc} ${tx.note || ''} ${tx.chan || ''}`.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const rawSearchStr = `${tx.desc} ${tx.note || ''} ${tx.chan || ''}`.toLowerCase();
+
+            for (const [k, v] of Object.entries(AUTO_CAT_RULES)) {
+                const cleanKey = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+                if (cleanSearchStr.includes(cleanKey) || rawSearchStr.includes(k.toLowerCase())) {
+                    tx.cat = v;
+                }
+            }
+            
+            // Auto-Omit standard transfers / making change
+            if (["Making Change", "Transfer"].includes(tx.cat) || cleanSearchStr.includes("makingchange")) {
+                tx.omit = true;
+            }
+        };
+
+        // --- ROBUST UTILITIES ---
+        const parseCurrency = (val) => {
+            if (!val) return 0;
+            let s = String(val).trim();
+            const isNegative = s.startsWith('(') && s.endsWith(')') || s.startsWith('-');
+            s = s.replace(/[^0-9.]/g, ''); 
+            let n = parseFloat(s);
+            if (isNegative) n = -Math.abs(n);
+            return isNaN(n) ? 0 : n;
+        };
+
+        const normalizeDate = (s) => {
+            if (!s || typeof s !== 'string') return new Date(0);
+            const parts = s.split(/[\/\s:-]/).filter(Boolean);
+            if (parts.length < 3) return new Date(0);
+            let d = parseInt(parts[0]), m = parseInt(parts[1]) - 1, y = parseInt(parts[2]);
+            if (y > 2400) y -= 543; 
+            else if (y < 100) y += 2000;
+            const h = parts[3] ? parseInt(parts[3]) : 0;
+            const min = parts[4] ? parseInt(parts[4]) : 0;
+            return new Date(y, m, d, h, min);
+        };
+
+        const formatAxisLabel = (val) => {
+            if (val >= 1000000) return `฿${(val/1000000).toFixed(1)}M`;
+            if (val >= 1000) return `฿${(val/1000).toFixed(0)}k`;
+            return `฿${val}`;
+        };
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [ledger, setLedger] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [syncing, setSyncing] = useState(false);
+            
+            // UI States
+            const [searchTerm, setSearchTerm] = useState('');
+            const [sort, setSort] = useState({ key: 'date', dir: 'desc' });
+            const [statusMsg, setStatusMsg] = useState(null);
+            const [selected, setSelected] = useState(new Set());
+            const [dbStatus, setDbStatus] = useState('connecting');
+            const [activeTab, setActiveTab] = useState('ledger'); 
+            
+            // Advanced Filters
+            const [showFilters, setShowFilters] = useState(false);
+            const [filterMonth, setFilterMonth] = useState('');
+            const [filterType, setFilterType] = useState('All');
+            const [filterMinAmt, setFilterMinAmt] = useState('');
+            const [filterMaxAmt, setFilterMaxAmt] = useState('');
+            const [filterOmit, setFilterOmit] = useState(false); 
+            const [catSearchTerm, setCatSearchTerm] = useState('');
+            const [excludedCats, setExcludedCats] = useState(new Set());
+
+            // Manager States
+            const [showCategoryManager, setShowCategoryManager] = useState(false);
+            const [managerSearch, setManagerSearch] = useState('');
+            const [editId, setEditId] = useState(null);
+            const [editForm, setEditForm] = useState({});
+            const [dialog, setDialog] = useState(null);
+            const filterPanelRef = useRef(null);
+
+            const lastBatchId = useMemo(() => localStorage.getItem('wet_last_batch'), [syncing]);
+
+            // PDF.js Worker Configuration
+            useEffect(() => {
+                if (window.pdfjsLib) {
+                    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                }
+            }, []);
+
+            // Firebase Auth
+            useEffect(() => {
+                let isMounted = true;
+                const initAuth = async () => {
+                    try {
+                        await auth.signInAnonymously();
+                    } catch (e) {
+                        console.error("Token expired. Re-authenticating anonymously:", e);
+                        if (isMounted) setDbStatus('auth-failed');
+                    }
+                };
+                initAuth();
+                const unsubscribe = auth.onAuthStateChanged((u) => {
+                    if (isMounted) setUser(u);
+                });
+                return () => {
+                    isMounted = false;
+                    unsubscribe();
+                };
+            }, []);
+
+            // Firebase Realtime Listener
+            useEffect(() => {
+                if (!user) return;
+                setLoading(true);
+                const colRef = getLedgerRef();
+                
+                const unsub = colRef.onSnapshot((snap) => {
+                    const data = [];
+                    snap.forEach(doc => data.push({ ...doc.data(), id: doc.id }));
+                    setLedger(data);
+                    setLoading(false);
+                    setDbStatus('connected');
+                }, (err) => {
+                    if (err.message.includes('permission') || err.message.includes('Missing or insufficient permissions')) {
+                        setDbStatus('blocked');
+                        showNotification('error', `FIREBASE BLOCKED: Go to Firestore Rules and set 'allow read, write: if true;'`);
+                    } else {
+                        setDbStatus('error');
+                        showNotification('error', `Sync Error: ${err.message}`);
+                    }
+                    setLoading(false);
+                });
+                return () => unsub();
+            }, [user]);
+
+            // Auto-hide notification handler
+            const showNotification = (type, text) => {
+                setStatusMsg({ type, text });
+                setTimeout(() => setStatusMsg(null), 5000);
+            };
+
+            // Close filters if clicked outside
+            useEffect(() => {
+                const handleClickOutside = (event) => {
+                    if (filterPanelRef.current && !filterPanelRef.current.contains(event.target) && !event.target.closest('.filter-btn')) {
+                        setShowFilters(false);
+                    }
+                };
+                document.addEventListener('mousedown', handleClickOutside);
+                return () => document.removeEventListener('mousedown', handleClickOutside);
+            }, []);
+
+            // Global Category Stats & Dynamic Master List
+            const allCategoryStats = useMemo(() => {
+                const stats = {};
+                ledger.forEach(tx => {
+                    const cat = tx.cat || 'General';
+                    if (!stats[cat]) stats[cat] = { count: 0 };
+                    stats[cat].count += 1;
+                });
+                return Object.entries(stats).map(([label, data]) => ({label, ...data})).sort((a,b) => b.count - a.count);
+            }, [ledger]);
+
+            // Dynamically combine hardcoded list with all tags ever created in DB
+            const combinedCategories = useMemo(() => {
+                const dbCats = ledger.map(tx => tx.cat || 'General');
+                return Array.from(new Set([...MAIN_CATEGORIES, ...dbCats])).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+            }, [ledger]);
+
+            const allCategories = allCategoryStats.map(c => c.label);
+
+            const toggleCategoryFilter = (cat) => {
+                const next = new Set(excludedCats);
+                if (next.has(cat)) next.delete(cat);
+                else next.add(cat);
+                setExcludedCats(next);
+            };
+
+            const selectAllCats = () => setExcludedCats(new Set());
+            const clearAllCats = () => setExcludedCats(new Set(allCategories));
+
+            // --- THE ULTIMATE ROUTER & PARSER ---
+            const processUltimateRaw = async (rawText, batchId) => {
+                const lines = rawText.split(/\r?\n/).filter(l => l.trim().length > 0);
+                if (lines.length === 0) return;
+                const firstLine = lines[0].toLowerCase();
+                
+                const isStructuredCSV = (firstLine.includes('date') || firstLine.includes('timestamp') || firstLine.includes('column 1')) 
+                                        && firstLine.includes(',') 
+                                        && !firstLine.includes('account no') 
+                                        && !firstLine.includes('account statement') 
+                                        && !firstLine.includes('scb');
+
+                const transactionsToSave = [];
+                const occurrenceTracker = {}; 
+
+                if (isStructuredCSV) {
+                     const headers = firstLine.replace(/^\uFEFF/, '').replace(/"/g, '').split(',').map(h => h.trim());
+                     lines.slice(1).forEach(line => {
+                         const cols = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(c => c.replace(/"/g, '').trim());
+                         const row = {};
+                         headers.forEach((h, idx) => { row[h] = cols[idx] || ''; });
+                         
+                         const amtRaw = row['amount'] || row['credit/debit'] || row['total amount'] || row['amount paid'];
+                         if (!amtRaw) return;
+
+                         const amt = parseCurrency(amtRaw);
+                         let dateStr = row['date'] || row['column 1'] || row['timestamp'] || '';
+                         let timeStr = row['time'] || '';
+                         
+                         if (dateStr.includes(' ')) {
+                             timeStr = dateStr.split(' ')[1] || timeStr;
+                             dateStr = dateStr.split(' ')[0];
+                         }
+
+                         if (dateStr && dateStr.toLowerCase() !== 'date' && dateStr.toLowerCase() !== 'column 1' && dateStr.toLowerCase() !== 'timestamp' && amt !== 0) {
+                             let type = String(amtRaw).trim().startsWith('-') ? 'Expense' : 'Income';
+                             if (row['amount paid']) type = 'Expense'; 
+                             
+                             const typeHint = String(row['type'] || row['payment or income?'] || '').toUpperCase();
+                             if (typeHint.includes('PAYMENT') || typeHint.includes('EXPENSE') || typeHint.includes('DEBIT')) type = 'Expense';
+                             if (typeHint.includes('INCOME') || typeHint.includes('CREDIT')) type = 'Income';
+                             
+                             const catHint = row['category'] && row['category'].trim() !== '' ? row['category'].trim() : 'General';
+
+                             const tx = {
+                                 date: timeStr ? `${dateStr} ${timeStr}` : dateStr,
+                                 amt: Math.abs(amt),
+                                 type: type,
+                                 desc: row['description'] || row['paid for what?'] || '',
+                                 note: row['note'] || row['notes'] || '',
+                                 cat: catHint,
+                                 chan: row['channel'] || row['paid from what money?'] || 'CSV',
+                                 omit: false,
+                                 batchId,
+                                 ts: Date.now()
+                             };
+                             
+                             applyAutoCat(tx);
+                             
+                             const safeDesc = tx.desc.replace(/[^a-zA-Z0-9]/g, '').substring(0, 15).toLowerCase();
+                             const fingerprint = `${tx.date}_${tx.amt}_${tx.type}_${safeDesc}`;
+                             occurrenceTracker[fingerprint] = (occurrenceTracker[fingerprint] || 0) + 1;
+                             
+                             tx.id = `tx_${tx.date.replace(/[^0-9]/g, '')}_${tx.amt}_${occurrenceTracker[fingerprint]}`;
+                             transactionsToSave.push(tx);
+                         }
+                     });
+                } else {
+                    let clean = rawText;
+
+                    clean = clean.replace(/["|]/g, ' ');
+                    clean = clean.replace(/,(?!\d)/g, ' '); 
+                    clean = clean.replace(/[\r\n]+/g, ' ');
+
+                    for (let i = 0; i < 3; i++) {
+                        clean = clean.replace(/\b(\d+)\s+(\d{3}(?:\.\d{1,2})?\b)/g, '$1$2');
+                    }
+
+                    let lastBalance = null;
+                    const bfMatch = clean.replace(/,/g, '').match(/(?:brought forward|ยอดยกมา|ยกมา)[^0-9]*?([\d.]+)/i);
+                    if (bfMatch) lastBalance = parseFloat(bfMatch[1]);
+
+                    const garbageList = [
+                        /TOTAL AMOUNTS \(Debit\)[\s\d.,]+TOTAL AMOUNTS \(Credit\)[\s\d.,]+TOTAL ITEMS[\s\d]+/gi,
+                        /\d{2}:\d{2}:\d{2}(?:\s*น\.)?(?:\s*\d{2}:\d{2}:\d{2}\.?)?/gi,
+                        /(?:หน้า|หนา)?\s*สาขา\s*เลขที่บัญชี\s*วันที่\s*Date\s*[\d-]+\s*CENTRALFESTIVAL SAMUI/gi,
+                        /Date\s*วันที่\s*Time\s*Code\s*Channel\s*Description\/?\s*Balance\/Baht\s*Debit\/Credit/gi,
+                        /เวลา\s*รายการ\s*(?:ช่องทาง|ของทาง)\s*ลูกหนี้\/เจ้าหนี้\s*ยอดเงินคงเหลือ\s*รายละเอ(?:ียด\/บันทึกช่วยจำ)?/gi,
+                        /This document is auto-generated[\s\S]*?(?=(?:\d{2}\/\d{2}\/(?:\d{4}|\d{2})[\s,]*)?\d{2}:\d{2}\b|$)/gi,
+                        /เอกสารฉบับนี้ออกโดยระบบอัตโนมัติ[\s\S]*?(?=(?:\d{2}\/\d{2}\/(?:\d{4}|\d{2})[\s,]*)?\d{2}:\d{2}\b|$)/gi,
+                        /SCB Call Center.*?02\s*777\s*7777/gi,
+                        /ACCOUNT STATEMENT WITH NOTES/gi,
+                        /STATEMENT OF SAVING ACCOUNT/gi,
+                        /รายการเดินบัญชี\s*พร้อมบันทึกช่วยจํา/gi,
+                        /ใบแจ้งรายการบัญชีออมทรัพย์/gi,
+                        /Account No\.\/Account Type\s*Statement Period\s*Page/gi,
+                        /Account No\./gi,
+                        /เลขที่บัญชี\/ประเภทบัญชี\s*วันที่\s*หน้า/gi,
+                        /เลขที่บัญชี\s*[\d-]+/gi,
+                        /MISTER LOREN DOUGLAS(?:\s*INFELD)?\s*(?:439-093321-8)?/gi,
+                        /INFELD Savings/gi,
+                        /Savings INFELD/gi,
+                        /THE SIAM COMMERCIAL BANK PUBLIC COMPANY LIMITED/gi,
+                        /ธนาคารไทยพาณิชย์ จำกัด \(มหาชน\)/gi,
+                        /สาขา CENTRALFESTIVAL SAMUI/gi,
+                        /ชื่อ - สกุล\s*Name/gi,
+                        /ที่อยู่\s*Address/gi,
+                        /28\/12 ม\.3 ต\.แม่น้ำ อ\.เกาะสมุย จ\.สุราษฎร์ธานี 84330/gi,
+                        /SCB\s*ไทยพาณิชย์/gi,
+                        /\d{2}\/\d{2}\/\d{4}\s*-\s*\d{2}\/\d{2}\/\d{4}/g,
+                        /Date\/Time\s*Code\/Channel\s*Debit\s*Credit\s*Balance\s*Description\/Note/gi,
+                        /Date\s*Time\s*Channel\s*Code\s*Debit\/Credit\s*Balance\/Baht\s*Description\/Note/gi,
+                        /วันที่\/เวลา\s*รายการ\/ช่องทาง\s*ลูกหนี้\s*เจ้าหนี้\s*ยอดเงินคงเหลือ\s*รายละเอียด\/บันทึกช่วยจำ/gi,
+                        /วันที่\s*เวลา\s*รายการ\s*(?:ช่องทาง|ของทาง)\s*ลูกหนี้\/เจ้าหนี้\s*ยอดเงินคงเหลือ\s*รายละเอียด\/บันทึกช่วยจำ/gi,
+                        /วันที่\/เวลา.*?บันทึกช่วยจำ/gi,
+                        /www\.scb\.co\.th/gi,
+                        /\bDESC\s*:/gi,
+                        /\bNOTE\s*:/gi,
+                        /\bDESC\b/gi,
+                        /\bNOTE\b/gi,
+                        /Page\s*\d+\s*\/\s*\d+/gi,
+                        /หนา\s*\d+\/\d+/gi,
+                        /หน้า\s*\d+\/\d+/gi,
+                        /(?:\s\b\d+\s*\/\s*\d+\b\s)/g,
+                        /ยอดเงินคงเหลือยกมา\s*\(Balance brought forward\)\s*\*{0,3}\s*[\d,.]+/gi,
+                        /ยกมา\s*\(BALANCE BROUGHT FORWARD\)\s*[\d,.]+/gi
+                    ];
+                    
+                    garbageList.forEach(g => { clean = clean.replace(g, ' '); });
+                    clean = clean.replace(/\s+/g, ' ').trim();
+
+                    const amtExp = "-?\\d[\\d,]*\\.\\d{1,2}";
+                    const chanExp = "[A-Za-z0-9]{2,4}(?:[\\/\\s][A-Za-z0-9]{2,6})?";
+                    const txAnchor = `(?:(?:\\d{2}/\\d{2}/(?:\\d{4}|\\d{2}))[\\s,]*)?\\d{2}:\\d{2}[\\s,]+${chanExp}[\\s,]+${amtExp}`;
+                    const txRegex = new RegExp(`(?:(\\d{2}/\\d{2}/(?:\\d{4}|\\d{2}))[\\s,]*)?(\\d{2}:\\d{2})[\\s,]+([A-Za-z0-9/\\s-]{2,20}?)[\\s,]+(${amtExp})[\\s,]*(?:(${amtExp})[\\s,]*)?(.*?)(?=${txAnchor}|$)`, 'gi');
+                    
+                    let match;
+                    let lastDate = "01/01/25"; 
+                    
+                    while ((match = txRegex.exec(clean)) !== null) {
+                        if (match[1]) lastDate = match[1];
+                        
+                        const time = match[2];
+                        const chan = match[3];
+                        const amtRaw = parseCurrency(match[4]);
+                        const balRaw = match[5] ? parseCurrency(match[5]) : null;
+                        
+                        let desc = match[6].trim();
+                        
+                        if (match[4] && desc.startsWith(match[4])) desc = desc.substring(match[4].length).trim();
+                        if (match[5] && desc.startsWith(match[5])) desc = desc.substring(match[5].length).trim();
+                        desc = desc.replace(/^[-|:,]+/, '').replace(/[-|:,]+$/, '').trim();
+
+                        let type = 'Expense';
+                        if (amtRaw < 0) {
+                            type = 'Expense';
+                        } else if (lastBalance !== null && balRaw !== null) {
+                            const diff = balRaw - lastBalance;
+                            if (Math.abs(diff - Math.abs(amtRaw)) < 0.1) type = 'Income';
+                            else if (Math.abs(diff + Math.abs(amtRaw)) < 0.1) type = 'Expense';
+                            else type = balRaw > lastBalance ? 'Income' : 'Expense';
+                        } else {
+                            if (/deposit|income|c1\/|refund|promptpay/i.test(chan + ' ' + desc)) {
+                                type = 'Income';
+                            }
+                        }
+                        if (balRaw !== null) lastBalance = balRaw;
+
+                        const tx = {
+                            date: `${lastDate} ${time}`,
+                            amt: Math.abs(amtRaw),
+                            type,
+                            desc: desc.substring(0, 300),
+                            note: '', 
+                            chan: chan.trim(),
+                            cat: 'General',
+                            omit: false,
+                            batchId,
+                            ts: Date.now()
+                        };
+
+                        applyAutoCat(tx);
+                        
+                        const safeDesc = tx.desc.replace(/[^a-zA-Z0-9]/g, '').substring(0, 15).toLowerCase();
+                        const fingerprint = `${tx.date}_${tx.amt}_${tx.type}_${safeDesc}`;
+                        occurrenceTracker[fingerprint] = (occurrenceTracker[fingerprint] || 0) + 1;
+                        
+                        tx.id = `tx_${lastDate.replace(/[^0-9]/g, '')}_${time.replace(':','')}__${tx.amt}_${occurrenceTracker[fingerprint]}`;
+                        transactionsToSave.push(tx);
+                    }
+                }
+
+                let savedCount = 0;
+                const CHUNK_SIZE = 200;
+                const colRef = getLedgerRef();
+
+                for (let i = 0; i < transactionsToSave.length; i += CHUNK_SIZE) {
+                    const batch = db.batch();
+                    transactionsToSave.slice(i, i + CHUNK_SIZE).forEach(entry => {
+                        batch.set(colRef.doc(entry.id), entry);
+                        savedCount++;
+                    });
+                    await batch.commit();
+                }
+
+                localStorage.setItem('wet_last_batch', batchId);
+                setSyncing(false);
+                showNotification('success', `Perfectly extracted ${savedCount} records.`);
+            };
+
+            const handleImport = async (e) => {
+                const file = e.target.files[0];
+                if (!file || !user) return;
+                if (dbStatus === 'blocked') {
+                    showNotification('error', `Cannot import: Firebase Database is blocked by Security Rules.`);
+                    e.target.value = null;
+                    return;
+                }
+
+                setSyncing(true);
+                const batchId = `import_${Date.now()}`;
+                showNotification('info', "Analyzing file structure...");
+
+                try {
+                    let fullText = '';
+                    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+                        if (!window.pdfjsLib) throw new Error("PDF Library is still loading. Please try again.");
+                        const arrayBuffer = await file.arrayBuffer();
+                        const pdf = await window.pdfjsLib.getDocument(arrayBuffer).promise;
+                        
+                        for (let i = 1; i <= pdf.numPages; i++) {
+                            const page = await pdf.getPage(i);
+                            const content = await page.getTextContent();
+                            fullText += content.items.map(item => item.str).join(' ') + ' ';
+                        }
+                    } else {
+                        fullText = await new Promise((resolve, reject) => {
+                            const r = new FileReader();
+                            r.onload = evt => resolve(evt.target.result);
+                            r.onerror = e => reject(e);
+                            r.readAsText(file);
+                        });
+                    }
+                    await processUltimateRaw(fullText, batchId);
+                } catch (err) {
+                    setSyncing(false);
+                    showNotification('error', `Import failed: ${err.message}`);
+                }
+                e.target.value = null;
+            };
+
+            // --- MANAGEMENT TOOLS ---
+            const applyRulesToExisting = () => {
+                if (dbStatus === 'blocked') return showNotification('error', "Database blocked.");
+                if (ledger.length === 0) return;
+                
+                setDialog({
+                    title: "Auto-Tag Records",
+                    message: "Scan the entire database and auto-apply categorization rules to all existing entries? (Includes Auto-Omitting Transfers)",
+                    confirmText: "Auto-Tag Now",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        showNotification('info', "Applying smart rules to database...");
+                        try {
+                            let updates = 0;
+                            const CHUNK = 400;
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < ledger.length; i += CHUNK) {
+                                const batch = db.batch();
+                                const chunk = ledger.slice(i, i + CHUNK);
+                                
+                                chunk.forEach(item => {
+                                    const originalCat = item.cat;
+                                    const originalOmit = item.omit;
+                                    applyAutoCat(item);
+                                    if (originalCat !== item.cat || originalOmit !== item.omit) {
+                                        batch.set(colRef.doc(item.id), { cat: item.cat, omit: item.omit }, { merge: true });
+                                        updates++;
+                                    }
+                                });
+                                await batch.commit();
+                            }
+                            showNotification('success', `Auto-categorized ${updates} records.`);
+                        } catch (err) {
+                            showNotification('error', `Failed: ${err.message}`);
+                        }
+                        setSyncing(false);
+                    }
+                });
+            };
+
+            const bulkCategorize = () => {
+                if (dbStatus === 'blocked') return showNotification('error', "Database blocked.");
+                setDialog({
+                    type: 'prompt',
+                    list: combinedCategories,
+                    title: "Bulk Categorize",
+                    message: `Assign a new category to the ${selected.size} selected rows:`,
+                    confirmText: "Save Category",
+                    onConfirm: async (cat) => {
+                        if (!cat || !cat.trim()) return;
+                        setSyncing(true);
+                        try {
+                            const CHUNK = 400;
+                            const ids = Array.from(selected);
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < ids.length; i += CHUNK) {
+                                const batch = db.batch();
+                                ids.slice(i, i + CHUNK).forEach(id => {
+                                    batch.set(colRef.doc(id), { cat: cat.trim() }, { merge: true });
+                                });
+                                await batch.commit();
+                            }
+                            setSelected(new Set());
+                            showNotification('success', "Categories updated.");
+                        } catch (err) {
+                            showNotification('error', `Update failed: ${err.message}`);
+                        }
+                        setSyncing(false);
+                    }
+                });
+            };
+
+            const bulkToggleOmit = () => {
+                if (dbStatus === 'blocked') return showNotification('error', "Database blocked.");
+                setDialog({
+                    title: "Toggle Omit Status",
+                    message: `Change the 'Omit' status for the ${selected.size} selected rows? Omitted rows are crossed out and ignored in all Income/Expense calculations.`,
+                    confirmText: "Toggle Omit",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        try {
+                            const CHUNK = 400;
+                            const ids = Array.from(selected);
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < ids.length; i += CHUNK) {
+                                const batch = db.batch();
+                                ids.slice(i, i + CHUNK).forEach(id => {
+                                    const tx = ledger.find(l => l.id === id);
+                                    if (tx) {
+                                        batch.set(colRef.doc(id), { omit: !tx.omit }, { merge: true });
+                                    }
+                                });
+                                await batch.commit();
+                            }
+                            setSelected(new Set());
+                            showNotification('success', "Omit statuses updated.");
+                        } catch (err) {
+                            showNotification('error', `Update failed: ${err.message}`);
+                        }
+                        setSyncing(false);
+                    }
+                });
+            };
+
+            const triggerDelete = (ids) => {
+                if (dbStatus === 'blocked') return showNotification('error', "Database blocked.");
+                if (!ids || ids.length === 0) return;
+                
+                setDialog({
+                    title: "Confirm Deletion",
+                    message: `Are you sure you want to permanently wipe ${ids.length} records? This action cannot be undone.`,
+                    danger: true,
+                    confirmText: "Yes, Delete",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        const CHUNK = 400;
+                        const colRef = getLedgerRef();
+                        try {
+                            for (let i = 0; i < ids.length; i += CHUNK) {
+                                const batch = db.batch();
+                                ids.slice(i, i + CHUNK).forEach(id => {
+                                    batch.delete(colRef.doc(id));
+                                });
+                                await batch.commit();
+                            }
+                            setSelected(new Set());
+                            showNotification('success', "Records removed.");
+                        } catch (e) {
+                            showNotification('error', `Delete failed: ${e.message}`);
+                        }
+                        setSyncing(false);
+                    }
+                });
+            };
+
+            const undoLastImport = () => {
+                const lastId = localStorage.getItem('wet_last_batch');
+                if (!lastId) {
+                    return showNotification('error', "No previous import found to undo.");
+                }
+                const toDelete = ledger.filter(i => i.batchId === lastId).map(i => i.id);
+                if (toDelete.length > 0) {
+                    triggerDelete(toDelete);
+                    localStorage.removeItem('wet_last_batch');
+                } else {
+                    showNotification('error', "No records found from the last import.");
+                }
+            };
+
+            const removeDuplicates = () => {
+                if (dbStatus === 'blocked') return showNotification('error', "Database blocked.");
+                setDialog({
+                    title: "Remove Duplicates",
+                    message: "Scan database and remove exact duplicate transactions? (Overlapping imports are natively securely overwritten by default)",
+                    confirmText: "Scan & Remove",
+                    onConfirm: async () => {
+                        setSyncing(true);
+                        showNotification('info', "Scanning for duplicates...");
+
+                        const seen = new Set();
+                        const duplicates = [];
+                        const sortedLedger = [...ledger].sort((a, b) => a.ts - b.ts);
+
+                        sortedLedger.forEach(tx => {
+                            const fingerprint = `${tx.date}_${tx.amt}_${tx.type}_${tx.desc}`;
+                            if (seen.has(fingerprint)) {
+                                duplicates.push(tx.id);
+                            } else {
+                                seen.add(fingerprint);
+                            }
+                        });
+
+                        if (duplicates.length === 0) {
+                            setSyncing(false);
+                            return showNotification('success', "No duplicates found.");
+                        }
+
+                        try {
+                            const CHUNK = 400;
+                            const colRef = getLedgerRef();
+                            for (let i = 0; i < duplicates.length; i += CHUNK) {
+                                const batch = db.batch();
+                                duplicates.slice(i, i + CHUNK).forEach(id => {
+                                    batch.delete(colRef.doc(id));
+                                });
+                                await batch.commit();
+                            }
+                            showNotification('success', `Removed ${duplicates.length} duplicate records.`);
+                        } catch (err) {
+                            showNotification('error', `Failed to remove duplicates: ${err.message}`);
+                        }
+                        setSyncing(false);
+                    }
+                });
+            };
+
+            // --- ADVANCED DATA FILTERING ---
+            const filtered = useMemo(() => {
+                let list = ledger.filter(i => {
+                    // 1. Omit Check
+                    if (filterOmit && i.omit) return false;
+
+                    // 2. Category Exclusions
+                    if (excludedCats.has(i.cat || 'General')) return false;
+
+                    // 3. Month Filter
+                    if (filterMonth) {
+                        const d = normalizeDate(i.date);
+                        if (d.getFullYear() !== 1970) {
+                            const mo = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2, '0')}`;
+                            if (mo !== filterMonth) return false;
+                        }
+                    }
+
+                    // 4. Type Filter
+                    if (filterType !== 'All' && i.type !== filterType) return false;
+
+                    // 5. Amount Limits
+                    const amt = i.amt || 0;
+                    if (filterMinAmt !== '' && amt < parseFloat(filterMinAmt)) return false;
+                    if (filterMaxAmt !== '' && amt > parseFloat(filterMaxAmt)) return false;
+
+                    // 6. Text Search (Expanded string mapping fixes the 2024 missing items bug)
+                    if (searchTerm) {
+                        const s = searchTerm.toLowerCase();
+                        const d = normalizeDate(i.date);
+                        const fullYear = d.getFullYear() !== 1970 ? d.getFullYear() : '';
+                        const searchTarget = `${i.desc || ''} ${i.note || ''} ${i.cat || ''} ${i.date || ''} ${fullYear} ${i.type || ''}`.toLowerCase();
+                        return searchTarget.includes(s);
+                    }
+                    return true;
+                });
+
+                return list.sort((a, b) => {
+                    const f = sort.dir === 'asc' ? 1 : -1;
+                    if (sort.key === 'date') return (normalizeDate(a.date) - normalizeDate(b.date)) * f;
+                    if (sort.key === 'cat') return (a.cat || 'General').localeCompare(b.cat || 'General') * f;
+                    return ((a[sort.key] || 0) > (b[sort.key] || 0) ? 1 : -1) * f;
+                });
+            }, [ledger, searchTerm, sort, excludedCats, filterMonth, filterType, filterMinAmt, filterMaxAmt, filterOmit]);
+
+            // Totals STRICTLY bypass omitted records
+            const totals = useMemo(() => filtered.reduce((acc, i) => {
+                if (i.omit) return acc; 
+                const amount = i.amt || 0;
+                if (i.type === 'Income') acc.inc += amount; else acc.exp += amount;
+                return acc;
+            }, { inc: 0, exp: 0 }), [filtered]);
+
+            // --- REPORTS LOGIC & CHARTS ---
+            const reportStats = useMemo(() => {
+                const monthly = {};
+                const categories = {};
+                
+                filtered.forEach(tx => {
+                    if (tx.omit) return; 
+                    
+                    const d = normalizeDate(tx.date);
+                    if (d.getFullYear() === 1970) return; 
+                    
+                    const mo = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2, '0')}`;
+                    const cat = tx.cat || 'General';
+                    
+                    if(!monthly[mo]) monthly[mo] = { label: mo, inc: 0, exp: 0 };
+                    if(!categories[cat]) categories[cat] = { inc: 0, exp: 0 };
+                    
+                    const amount = tx.amt || 0;
+                    if (tx.type === 'Income') {
+                        monthly[mo].inc += amount;
+                        categories[cat].inc += amount;
+                    } else {
+                        monthly[mo].exp += amount;
+                        categories[cat].exp += amount;
+                    }
+                });
+
+                const sortedMonthly = Object.values(monthly).sort((a,b) => a.label.localeCompare(b.label)); 
+                const maxMonthVal = sortedMonthly.length > 0 ? Math.max(...sortedMonthly.flatMap(m => [m.inc, m.exp])) : 1;
+
+                const sortedCats = Object.entries(categories).map(([label, data]) => ({label, ...data}))
+                    .filter(c => c.inc > 0 || c.exp > 0)
+                    .sort((a,b) => b.exp - a.exp);
+                const maxCatExp = sortedCats.length > 0 ? Math.max(...sortedCats.map(c => c.exp)) : 1;
+
+                return {
+                    monthly: sortedMonthly,
+                    maxMonthVal,
+                    categories: sortedCats,
+                    maxCatExp
+                };
+            }, [filtered]);
+
+            if (loading && !user) {
+                return (
+                    <div className="h-screen flex flex-col items-center justify-center bg-slate-50 text-slate-900">
+                        <i className="ph ph-spinner animate-spin text-blue-600 mb-4 text-4xl"></i>
+                        <p className="text-[11px] font-black uppercase tracking-[0.2em] text-slate-400">Connecting Database...</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex flex-col bg-[#fdfdfd] text-[13px] font-sans text-slate-900 overflow-hidden relative flex-1">
+
+                    {/* ULTRA DENSE HEADER */}
+                    <header className="bg-white border-b flex flex-col md:flex-row items-center justify-between px-4 py-1.5 md:h-12 shrink-0 z-30 shadow-sm gap-2">
+                        
+                        {/* 1. Logo (Left) */}
+                        <div className="flex items-center gap-2 w-full md:w-[200px]">
+                            <div className="bg-slate-900 text-white p-1 rounded-md shadow-sm">
+                                <i className="ph ph-database text-base"></i>
+                            </div>
+                            <div className="leading-none">
+                                <div className="font-black text-slate-900 text-[14px] tracking-tight">WET<span className="text-blue-600">LEDGER</span></div>
+                                <div className="text-[8px] font-bold text-slate-400 uppercase tracking-widest mt-0.5">Density Build</div>
+                            </div>
+                        </div>
+
+                        {/* 2. Tools & Search (Center) */}
+                        <div className="flex flex-1 flex-wrap items-center justify-center gap-1 w-full">
+                            {activeTab === 'ledger' && (
+                                <>
+                                    <div className="relative w-full max-w-[220px]">
+                                        <i className="ph ph-magnifying-glass absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 text-xs"></i>
+                                        <input 
+                                            className="pl-6 pr-2 py-1 bg-slate-50 border border-slate-200 rounded text-xs outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white transition-all shadow-inner w-full font-medium" 
+                                            placeholder="Search ledger..." 
+                                            value={searchTerm} 
+                                            onChange={e => setSearchTerm(e.target.value)} 
+                                        />
+                                    </div>
+
+                                    {/* Advanced Filter Button */}
+                                    <div className="relative" ref={filterPanelRef}>
+                                        <button 
+                                            onClick={() => setShowFilters(!showFilters)} 
+                                            className={`px-2 py-1 border rounded flex items-center gap-1 text-[11px] font-bold transition-all filter-btn ${showFilters || excludedCats.size > 0 || filterMonth || filterType !== 'All' || filterOmit ? 'bg-blue-50 border-blue-200 text-blue-600 shadow-inner' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
+                                            title="Advanced Filters"
+                                        >
+                                            <i className="ph ph-funnel text-xs"></i> Filters
+                                            {(excludedCats.size > 0 || filterMonth || filterType !== 'All' || filterOmit) && <span className="bg-blue-600 text-white text-[9px] px-1 rounded-full">!</span>}
+                                        </button>
+
+                                        {/* Filter Dropdown Panel */}
+                                        {showFilters && (
+                                            <div className="absolute top-full left-0 md:left-1/2 md:-translate-x-1/2 mt-2 w-[340px] bg-white border border-slate-200 shadow-2xl rounded-xl p-4 z-50 animate-in slide-in-from-top-2">
+                                                <div className="grid grid-cols-2 gap-3 mb-3 pb-3 border-b border-slate-100">
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Month</label>
+                                                        <input type="month" value={filterMonth} onChange={e => setFilterMonth(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400"/>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Type</label>
+                                                        <select value={filterType} onChange={e => setFilterType(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400">
+                                                            <option value="All">All Transactions</option>
+                                                            <option value="Income">Income Only</option>
+                                                            <option value="Expense">Expense Only</option>
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Min ฿</label>
+                                                        <input type="number" placeholder="0" value={filterMinAmt} onChange={e => setFilterMinAmt(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400"/>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Max ฿</label>
+                                                        <input type="number" placeholder="Any" value={filterMaxAmt} onChange={e => setFilterMaxAmt(e.target.value)} className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1 text-xs outline-none focus:border-blue-400"/>
+                                                    </div>
+                                                </div>
+                                                
+                                                <div className="mb-3 pb-3 border-b border-slate-100">
+                                                    <label className="flex items-center gap-2 cursor-pointer">
+                                                        <input type="checkbox" checked={filterOmit} onChange={e => setFilterOmit(e.target.checked)} className="accent-blue-600 rounded w-4 h-4"/>
+                                                        <span className="text-[11px] font-bold text-slate-600">Hide 'Omitted' transactions from table view</span>
+                                                    </label>
+                                                </div>
+
+                                                <div className="flex justify-between items-end mb-2">
+                                                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Categories</label>
+                                                    <div className="text-[10px] font-bold">
+                                                        <button onClick={selectAllCats} className="text-blue-600 hover:underline">All</button>
+                                                        <span className="text-slate-300 mx-1">|</span>
+                                                        <button onClick={clearAllCats} className="text-blue-600 hover:underline">None</button>
+                                                    </div>
+                                                </div>
+                                                <input 
+                                                    type="text" placeholder="Search categories to filter..." 
+                                                    value={catSearchTerm} onChange={e => setCatSearchTerm(e.target.value)}
+                                                    className="w-full bg-slate-50 border border-slate-200 rounded-md px-2 py-1.5 text-xs mb-2 outline-none focus:border-blue-400"
+                                                />
+                                                <div className="max-h-40 overflow-y-auto border border-slate-100 rounded-md bg-slate-50/50 p-1">
+                                                    {allCategories.filter(c => c.toLowerCase().includes(catSearchTerm.toLowerCase())).map(cat => (
+                                                        <label key={cat} className="flex items-center gap-2 p-1.5 hover:bg-slate-100 rounded cursor-pointer">
+                                                            <input 
+                                                                type="checkbox" 
+                                                                checked={!excludedCats.has(cat)} 
+                                                                onChange={() => toggleCategoryFilter(cat)}
+                                                                className="accent-blue-600 rounded w-3.5 h-3.5"
+                                                            />
+                                                            <span className="text-xs font-medium text-slate-700 truncate">{cat}</span>
+                                                        </label>
+                                                    ))}
+                                                    {allCategories.length === 0 && <div className="text-[11px] text-slate-400 p-2 text-center">No categories found.</div>}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <button onClick={() => setShowCategoryManager(true)} className="px-2 py-1 border rounded flex items-center gap-1 bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 text-[11px] font-bold" title="Manage Categories"><i className="ph ph-folders text-xs"></i> Cats</button>
+                                    
+                                    <label className="bg-blue-600 text-white px-2 py-1 rounded font-bold cursor-pointer hover:bg-blue-700 transition-all flex items-center gap-1 text-[11px] shadow-sm">
+                                        <i className="ph ph-upload-simple"></i> Upload
+                                        <input type="file" accept=".csv, .pdf, text/csv, application/pdf" className="hidden" onChange={handleImport} />
+                                    </label>
+                                </>
+                            )}
+                        </div>
+
+                        {/* 3. Tabs (Right) */}
+                        <div className="flex items-center justify-end w-full md:w-[200px]">
+                            <div className="flex bg-slate-100 p-0.5 rounded shadow-inner border border-slate-200">
+                                <button onClick={() => setActiveTab('ledger')} className={`px-2 py-0.5 rounded-[3px] text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1 ${activeTab === 'ledger' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                                    <i className="ph ph-table text-xs"></i> Ledger
+                                </button>
+                                <button onClick={() => setActiveTab('reports')} className={`px-2 py-0.5 rounded-[3px] text-[10px] font-black uppercase tracking-wider transition-all flex items-center gap-1 ${activeTab === 'reports' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+                                    <i className="ph ph-chart-line-up text-xs"></i> Reports
+                                </button>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Status Alerts (Dismissible) */}
+                    {statusMsg && (
+                        <div className={`absolute top-14 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-4 py-2 rounded-lg text-xs font-bold shadow-xl animate-in fade-in slide-in-from-top-2 duration-300 ${statusMsg.type === 'error' ? 'bg-red-600 text-white' : 'bg-emerald-600 text-white'}`}>
+                            {statusMsg.type === 'error' ? <i className="ph ph-warning text-base"></i> : <i className="ph ph-check-circle text-base"></i>}
+                            <span>{statusMsg.text}</span>
+                            <button onClick={() => setStatusMsg(null)} className="ml-2 hover:opacity-70 transition-opacity"><i className="ph ph-x text-base"></i></button>
+                        </div>
+                    )}
+
+                    {/* Banner: Ultra-Dense */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 border-b bg-white divide-x divide-y md:divide-y-0 divide-slate-100 shrink-0 z-10 shadow-sm">
+                        <div className="p-1.5 md:p-2 bg-emerald-50/20 px-4">
+                            <div className="flex items-center gap-1">
+                                <div className="text-emerald-600"><i className="ph ph-arrow-up-right text-xs"></i></div>
+                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Active Income</p>
+                            </div>
+                            <p className="text-xl md:text-2xl font-black text-emerald-600 tracking-tight">฿{totals.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                        </div>
+                        
+                        <div className="p-1.5 md:p-2 bg-rose-50/20 px-4">
+                            <div className="flex items-center gap-1">
+                                <div className="text-rose-600"><i className="ph ph-arrow-down-left text-xs"></i></div>
+                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Active Expense</p>
+                            </div>
+                            <p className="text-xl md:text-2xl font-black text-rose-600 tracking-tight">฿{totals.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                        </div>
+
+                        <div className="p-1.5 md:p-2 bg-blue-50/20 px-4">
+                            <div className="flex items-center gap-1">
+                                <div className="text-blue-600"><i className="ph ph-wallet text-xs"></i></div>
+                                <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Active Net Profit</p>
+                            </div>
+                            <p className={`text-xl md:text-2xl font-black tracking-tight ${totals.inc - totals.exp >= 0 ? 'text-blue-700' : 'text-orange-600'}`}>฿{(totals.inc - totals.exp).toLocaleString(undefined, {minimumFractionDigits:2})}</p>
+                        </div>
+
+                        <div className="p-1.5 md:p-2 flex flex-col justify-center items-end bg-slate-50/50 px-4">
+                            <div className="flex flex-wrap justify-end gap-1.5 w-full">
+                                {selected.size > 0 && activeTab === 'ledger' ? (
+                                    <>
+                                        <button onClick={bulkCategorize} className="flex-1 bg-slate-900 text-white rounded font-black uppercase text-[10px] py-1 shadow-sm hover:bg-black flex items-center justify-center gap-1"><i className="ph ph-tag"></i> Tag</button>
+                                        <button onClick={bulkToggleOmit} className="flex-1 bg-slate-700 text-white rounded font-black uppercase text-[10px] py-1 shadow-sm hover:bg-slate-800 flex items-center justify-center gap-1" title="Toggle Omit Status"><i className="ph ph-eye-slash"></i> Omit</button>
+                                        <button onClick={() => triggerDelete(Array.from(selected))} className="flex-1 bg-red-600 text-white rounded font-black uppercase text-[10px] py-1 shadow-sm hover:bg-red-700 flex items-center justify-center gap-1"><i className="ph ph-trash"></i> Del</button>
+                                    </>
+                                ) : (
+                                    <>
+                                        {activeTab === 'ledger' && (
+                                            <>
+                                                <button onClick={removeDuplicates} className="flex-1 bg-amber-100 text-amber-700 px-2 py-1 rounded font-black uppercase text-[10px] flex items-center justify-center gap-1 hover:bg-amber-200" title="Deduplicate"><i className="ph ph-copy"></i> Dedup</button>
+                                                <button onClick={applyRulesToExisting} className="flex-1 bg-indigo-100 text-indigo-700 px-2 py-1 rounded font-black uppercase text-[10px] flex items-center justify-center gap-1 hover:bg-indigo-200" title="Auto-Tag"><i className="ph ph-magic-wand"></i> Auto-Tag</button>
+                                            </>
+                                        )}
+                                        {activeTab === 'ledger' && <button onClick={() => triggerDelete(ledger.map(i => i.id))} className="bg-red-100 text-red-600 px-2 py-1 rounded font-black uppercase text-[10px] flex items-center justify-center hover:bg-red-200" title="Wipe Database"><i className="ph ph-eraser"></i> Wipe</button>}
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* MAIN CONTENT AREA */}
+                    <main className="flex-1 overflow-y-auto overflow-x-hidden bg-white relative">
+                        
+                        {/* TAB: LEDGER (Ultra-Dense) */}
+                        {activeTab === 'ledger' && (
+                            <div className="w-full overflow-x-auto block">
+                                <table className="w-full min-w-[800px] text-left border-collapse table-fixed">
+                                    <thead className="sticky top-0 bg-slate-100 z-20 border-b border-slate-200 shadow-sm">
+                                        <tr className="text-slate-600 font-black uppercase text-[11px] tracking-widest">
+                                            <th className="px-2 py-1 w-10 text-center border-r border-slate-200">
+                                                <button onClick={() => {
+                                                    if (selected.size === filtered.length && filtered.length > 0) setSelected(new Set());
+                                                    else setSelected(new Set(filtered.map(i => i.id)));
+                                                }}>
+                                                    {selected.size > 0 && selected.size === filtered.length ? <i className="ph ph-check-square text-base text-blue-600"></i> : <i className="ph ph-square text-base"></i>}
+                                                </button>
+                                            </th>
+                                            <th className="px-2 py-1 w-28 cursor-pointer hover:text-blue-600 transition-colors border-r border-slate-200" onClick={() => setSort({key:'date', dir: sort.dir==='asc'?'desc':'asc'})}>Date/Time</th>
+                                            <th className="px-2 py-1 w-16 border-r border-slate-200 text-center">Type</th>
+                                            <th className="px-2 py-1 text-right w-24 cursor-pointer hover:text-blue-600 border-r border-slate-200" onClick={() => setSort({key:'amt', dir: sort.dir==='asc'?'desc':'asc'})}>Amount</th>
+                                            <th className="px-2 py-1 border-r border-slate-200">Description & Notes</th>
+                                            <th className="px-2 py-1 w-40 cursor-pointer hover:text-blue-600 border-r border-slate-200" onClick={() => setSort({key:'cat', dir: sort.dir==='asc'?'desc':'asc'})}>Category</th>
+                                            <th className="px-1 py-1 w-8"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100 text-xs md:text-sm">
+                                        {filtered.map(item => (
+                                            <tr key={item.id} className={`hover:bg-blue-50/40 transition-colors group ${selected.has(item.id) ? 'bg-blue-50/60' : ''} ${item.omit ? 'opacity-50 grayscale' : ''}`}>
+                                                <td className="px-2 py-0.5 text-center border-r border-slate-50">
+                                                    <button onClick={() => {
+                                                        const next = new Set(selected);
+                                                        if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
+                                                        setSelected(next);
+                                                    }}>
+                                                        {selected.has(item.id) ? <i className="ph ph-check-square text-lg text-blue-600"></i> : <i className="ph ph-square text-lg text-slate-200 group-hover:text-slate-400"></i>}
+                                                    </button>
+                                                </td>
+                                                <td className="px-2 py-0.5 font-mono text-[11px] text-slate-500 whitespace-nowrap border-r border-slate-50 truncate">{item.date}</td>
+                                                <td className="px-2 py-0.5 border-r border-slate-50 text-center">
+                                                    <span className={`px-1 rounded text-[10px] font-black uppercase tracking-wider ${item.type === 'Income' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                        {item.type === 'Income' ? 'INC' : 'EXP'}
+                                                    </span>
+                                                </td>
+                                                <td className={`px-2 py-0.5 text-right font-bold whitespace-nowrap border-r border-slate-50 ${item.type === 'Income' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                    {item.omit ? (
+                                                        <span className="text-slate-400 line-through">฿{(item.amt || 0).toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                                                    ) : (
+                                                        <span>฿{(item.amt || 0).toLocaleString(undefined, {minimumFractionDigits:2})}</span>
+                                                    )}
+                                                </td>
+                                                <td className="px-2 py-0.5 border-r border-slate-50 overflow-hidden relative" title={`${item.desc} ${item.note ? `| ${item.note}` : ''}`}>
+                                                    <div className="font-medium text-slate-800 truncate whitespace-nowrap text-xs">
+                                                        {item.desc} {item.note && <span className="text-slate-400 font-normal ml-1 text-[11px]">| <span className="italic">{item.note}</span></span>}
+                                                    </div>
+                                                </td>
+                                                <td className="px-2 py-0.5 border-r border-slate-50 overflow-hidden flex items-center justify-between">
+                                                    <span className="bg-slate-100 px-1.5 py-0.5 rounded text-[10px] text-slate-600 font-bold uppercase truncate block text-left flex-1">{item.cat || 'General'}</span>
+                                                    {item.omit && <span className="bg-slate-700 text-white px-1 rounded text-[9px] font-black tracking-widest ml-1">OMIT</span>}
+                                                </td>
+                                                <td className="px-1 py-0.5 text-center opacity-0 group-hover:opacity-100">
+                                                    <button onClick={() => {setEditId(item.id); setEditForm({...item})}} className="text-slate-400 hover:text-blue-600 transition-colors"><i className="ph ph-pencil-simple text-sm"></i></button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                                
+                                {filtered.length === 0 && !syncing && (
+                                    <div className="py-20 text-center flex flex-col items-center gap-3 text-slate-300">
+                                        <i className="ph ph-cloud text-5xl"></i>
+                                        <div className="space-y-1">
+                                            <p className="font-black uppercase tracking-[0.3em] text-xs text-slate-400">No Data Found</p>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* TAB: REPORTS (Redesigned Vertical Column Chart w/ Axes) */}
+                        {activeTab === 'reports' && (
+                            <div className="p-2 md:p-4 max-w-6xl mx-auto space-y-6">
+                                
+                                {/* Top Summary Charts */}
+                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                    
+                                    {/* Monthly Trend Chart (Dense Vertical Columns w/ Grid Lines) */}
+                                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 relative">
+                                        <h2 className="text-[11px] font-black text-slate-500 uppercase tracking-widest mb-4 flex items-center gap-2"><i className="ph ph-chart-bar text-blue-600"></i> Monthly Trends</h2>
+                                        
+                                        {/* Chart Container */}
+                                        <div className="relative h-64 w-full">
+                                            {/* Background Y-Axis Grid Lines */}
+                                            {reportStats.monthly.length > 0 && (
+                                                <div className="absolute inset-0 flex flex-col justify-between pointer-events-none pb-8 pl-10 pr-2 pt-2 z-0">
+                                                    {[1, 0.75, 0.5, 0.25, 0].map(pct => (
+                                                        <div key={pct} className="w-full border-t border-slate-200 border-dashed relative">
+                                                            <span className="absolute -top-2.5 -left-10 text-[9px] text-slate-400 font-medium">
+                                                                {pct === 0 ? '0' : formatAxisLabel(reportStats.maxMonthVal * pct)}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+
+                                            {/* Bars Data */}
+                                            <div className="absolute inset-0 flex items-end gap-3 overflow-x-auto pb-8 pt-2 pl-12 pr-2 z-10 custom-scrollbar">
+                                                {reportStats.monthly.map((stat, i) => (
+                                                    <div key={stat.label} className="flex flex-col items-center gap-2 group relative min-w-[36px] h-full justify-end">
+                                                        {/* Hover Tooltip */}
+                                                        <div className="absolute bottom-full mb-2 hidden group-hover:block bg-slate-900 text-white text-[11px] p-3 rounded-lg z-50 whitespace-nowrap shadow-2xl">
+                                                            <p className="font-black mb-1 border-b border-slate-700 pb-1">{stat.label}</p>
+                                                            <p className="text-emerald-400">Inc: ฿{stat.inc.toLocaleString(undefined, {maximumFractionDigits:0})}</p>
+                                                            <p className="text-rose-400">Exp: ฿{stat.exp.toLocaleString(undefined, {maximumFractionDigits:0})}</p>
+                                                            <p className={`font-bold mt-1 pt-1 border-t border-slate-700 ${stat.inc - stat.exp >= 0 ? 'text-blue-400' : 'text-orange-400'}`}>Net: ฿{(stat.inc - stat.exp).toLocaleString(undefined, {maximumFractionDigits:0})}</p>
+                                                        </div>
+                                                        {/* Vertical Bars container matches the inner grid height */}
+                                                        <div className="flex items-end gap-0.5 h-[calc(100%-1.25rem)] w-full justify-center">
+                                                            <div style={{height: `${Math.max((stat.inc/reportStats.maxMonthVal)*100, 1)}%`}} className="w-4 bg-emerald-400 rounded-t hover:bg-emerald-500 transition-colors shadow-sm"></div>
+                                                            <div style={{height: `${Math.max((stat.exp/reportStats.maxMonthVal)*100, 1)}%`}} className="w-4 bg-rose-400 rounded-t hover:bg-rose-500 transition-colors shadow-sm"></div>
+                                                        </div>
+                                                        <span className="text-[10px] font-bold text-slate-500 absolute -bottom-1.5 w-16 text-center">{stat.label.split('-')[1]}/{stat.label.split('-')[0].substring(2)}</span>
+                                                    </div>
+                                                ))}
+                                                {reportStats.monthly.length === 0 && <div className="w-full h-full flex items-center justify-center text-slate-400 text-sm">No active data to chart</div>}
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Top Expenses by Category Chart */}
+                                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+                                        <h2 className="text-[11px] font-black text-slate-500 uppercase tracking-widest mb-4 flex items-center gap-2"><i className="ph ph-chart-pie-slice text-blue-600"></i> Top Expenses by Category</h2>
+                                        <div className="h-64 overflow-y-auto space-y-3 pr-2 custom-scrollbar">
+                                            {reportStats.categories.slice(0, 12).map((cat, i) => (
+                                                <div key={cat.label} className="flex items-center gap-2 text-xs">
+                                                    <div className="w-28 truncate font-bold text-slate-600" title={cat.label}>{cat.label}</div>
+                                                    <div className="flex-1 bg-slate-100 h-3 rounded-r-md overflow-hidden">
+                                                        <div style={{width: `${(cat.exp/reportStats.maxCatExp)*100}%`, animationDelay: `${i*0.05}s`}} className="bg-rose-400 h-full animate-grow-right shadow-sm"></div>
+                                                    </div>
+                                                    <div className="w-20 text-right font-mono font-bold text-rose-600">฿{cat.exp.toLocaleString(undefined, {maximumFractionDigits:0})}</div>
+                                                </div>
+                                            ))}
+                                            {reportStats.categories.length === 0 && <div className="w-full h-full flex items-center justify-center text-slate-400 text-sm">No active data to chart</div>}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Raw Data Tables */}
+                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                                    <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
+                                        <div className="bg-slate-50 p-2 border-b border-slate-200">
+                                            <h2 className="text-[11px] font-black text-slate-600 uppercase tracking-widest pl-2">Monthly Data</h2>
+                                        </div>
+                                        <div className="overflow-x-auto max-h-[400px] overflow-y-auto custom-scrollbar">
+                                            <table className="w-full text-left border-collapse text-xs">
+                                                <thead className="bg-white sticky top-0 border-b">
+                                                    <tr className="text-slate-500 font-bold uppercase tracking-wider text-[10px]">
+                                                        <th className="px-4 py-2">Month</th>
+                                                        <th className="px-4 py-2 text-right">Income</th>
+                                                        <th className="px-4 py-2 text-right">Expense</th>
+                                                        <th className="px-4 py-2 text-right">Net</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {reportStats.monthly.map(stat => (
+                                                        <tr key={stat.label} className="hover:bg-slate-50">
+                                                            <td className="px-4 py-2 font-bold text-slate-600">{stat.label}</td>
+                                                            <td className="px-4 py-2 text-right font-medium text-emerald-600">฿{stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                            <td className="px-4 py-2 text-right font-medium text-rose-600">฿{stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}</td>
+                                                            <td className={`px-4 py-2 text-right font-black ${stat.inc - stat.exp >= 0 ? 'text-blue-600' : 'text-orange-600'}`}>
+                                                                ฿{(stat.inc - stat.exp).toLocaleString(undefined, {minimumFractionDigits:2})}
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
+                                        <div className="bg-slate-50 p-2 border-b border-slate-200">
+                                            <h2 className="text-[11px] font-black text-slate-600 uppercase tracking-widest pl-2">Category Totals</h2>
+                                        </div>
+                                        <div className="overflow-x-auto max-h-[400px] overflow-y-auto custom-scrollbar">
+                                            <table className="w-full text-left border-collapse text-xs">
+                                                <thead className="bg-white sticky top-0 border-b">
+                                                    <tr className="text-slate-500 font-bold uppercase tracking-wider text-[10px]">
+                                                        <th className="px-4 py-2">Category</th>
+                                                        <th className="px-4 py-2 text-right">Income</th>
+                                                        <th className="px-4 py-2 text-right">Expense</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {reportStats.categories.map(stat => (
+                                                        <tr key={stat.label} className="hover:bg-slate-50">
+                                                            <td className="px-4 py-2 font-bold text-slate-600 truncate max-w-[150px]" title={stat.label}>{stat.label}</td>
+                                                            <td className="px-4 py-2 text-right font-medium text-emerald-600">{stat.inc > 0 ? `฿${stat.inc.toLocaleString(undefined, {minimumFractionDigits:2})}` : '-'}</td>
+                                                            <td className="px-4 py-2 text-right font-medium text-rose-600">{stat.exp > 0 ? `฿${stat.exp.toLocaleString(undefined, {minimumFractionDigits:2})}` : '-'}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+
+                    {/* Global Status Footer */}
+                    <footer className="bg-white border-t flex flex-col md:flex-row items-center justify-between px-3 py-1 md:h-8 shrink-0 z-30 shadow-2xl gap-1">
+                        <div className="flex items-center gap-4 w-full md:w-auto justify-between md:justify-start">
+                            <div className="flex items-center gap-1.5">
+                                {dbStatus === 'blocked' ? <i className="ph ph-warning-circle text-red-500 text-xs"></i> : <div className={`w-2 h-2 rounded-full ${user && dbStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`}></div>}
+                                <span className={`text-[10px] font-black uppercase tracking-widest ${dbStatus === 'blocked' ? 'text-red-500' : 'text-slate-500'}`}>{dbStatus === 'blocked' ? 'DB BLOCKED' : user ? 'Stable' : 'Offline'}</span>
+                            </div>
+                            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest hidden md:inline">Path: /artifacts/{appId}/public/data/ledger</span>
+                            <div className="flex items-center gap-2 md:ml-auto">
+                                {syncing && <span className="text-blue-600 font-black text-[10px] animate-pulse flex items-center gap-1"><i className="ph ph-arrows-clockwise animate-spin"></i> SYNC</span>}
+                                <span className="text-[10px] text-slate-900 font-black tracking-tighter uppercase">Records: {ledger.length.toLocaleString()}</span>
+                            </div>
+                        </div>
+                    </footer>
+
+                    {/* CATEGORY MANAGER MODAL */}
+                    {showCategoryManager && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[110] flex items-center justify-center p-2 md:p-4 animate-in fade-in">
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl flex flex-col max-h-[90vh] animate-in zoom-in-95">
+                                <div className="flex justify-between items-center p-4 border-b bg-slate-50 rounded-t-xl">
+                                    <h3 className="font-black uppercase tracking-widest text-slate-900 text-base flex items-center gap-2"><i className="ph ph-folders text-blue-600 text-xl"></i> Manage Categories</h3>
+                                    <button onClick={() => setShowCategoryManager(false)} className="text-slate-400 hover:text-slate-600 bg-slate-200 hover:bg-slate-300 p-1.5 rounded-md transition-colors"><i className="ph ph-x text-lg"></i></button>
+                                </div>
+                                <div className="p-3 border-b border-slate-100 bg-white shadow-sm z-20">
+                                    <div className="relative">
+                                        <i className="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-base"></i>
+                                        <input 
+                                            value={managerSearch}
+                                            onChange={(e) => setManagerSearch(e.target.value)}
+                                            placeholder="Search categories to manage..."
+                                            className="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium focus:border-blue-500 focus:bg-white outline-none transition-all"
+                                        />
+                                    </div>
+                                </div>
+                                <div className="p-0 overflow-y-auto flex-1 custom-scrollbar">
+                                    <table className="w-full text-left border-collapse">
+                                        <thead className="bg-slate-50 sticky top-0 border-b z-10 shadow-sm">
+                                            <tr className="text-[10px] text-slate-500 uppercase tracking-widest font-black">
+                                                <th className="p-3 border-r">Category Name</th>
+                                                <th className="p-3 border-r text-center w-20">Uses</th>
+                                                <th className="p-3 text-right w-80">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="text-sm divide-y">
+                                            {allCategoryStats.filter(s => s.label.toLowerCase().includes(managerSearch.toLowerCase())).map(stat => (
+                                                <tr key={stat.label} className="hover:bg-blue-50/50 transition-colors">
+                                                    <td className="p-2 md:p-3 font-bold text-slate-700 border-r truncate max-w-[200px]">{stat.label}</td>
+                                                    <td className="p-2 md:p-3 text-slate-500 font-medium text-center border-r">{stat.count}</td>
+                                                    <td className="p-2 md:p-3 text-right flex flex-wrap justify-end gap-1.5">
+                                                        <button 
+                                                            onClick={() => {
+                                                                const others = allCategories.filter(c => c !== stat.label);
+                                                                setExcludedCats(new Set(others));
+                                                                setFilterOmit(false); 
+                                                                setShowCategoryManager(false);
+                                                            }} 
+                                                            className="text-xs text-slate-600 hover:text-white font-bold bg-slate-100 hover:bg-slate-600 px-2.5 py-1.5 rounded-md transition-colors shadow-sm"
+                                                            title="Filter main ledger to show only this category"
+                                                        >Focus</button>
+                                                        <button 
+                                                            onClick={() => {
+                                                                setDialog({
+                                                                    title: 'Omit Entire Category',
+                                                                    message: `Mark all ${stat.count} items in '${stat.label}' as Omitted? This acts as a 'Transfer' and removes them from all Income/Expense calculations.`,
+                                                                    confirmText: 'Omit All',
+                                                                    onConfirm: async () => {
+                                                                        setSyncing(true);
+                                                                        try {
+                                                                            const CHUNK = 400;
+                                                                            const idsToUpdate = ledger.filter(tx => (tx.cat || 'General') === stat.label);
+                                                                            const colRef = getLedgerRef();
+                                                                            for (let i = 0; i < idsToUpdate.length; i += CHUNK) {
+                                                                                const batch = db.batch();
+                                                                                idsToUpdate.slice(i, i + CHUNK).forEach(tx => {
+                                                                                    batch.set(colRef.doc(tx.id), { omit: true }, { merge: true });
+                                                                                });
+                                                                                await batch.commit();
+                                                                            }
+                                                                            showNotification('success', `Omitted ${idsToUpdate.length} items.`);
+                                                                        } catch (err) {
+                                                                            showNotification('error', `Update failed: ${err.message}`);
+                                                                        }
+                                                                        setSyncing(false);
+                                                                    }
+                                                                });
+                                                            }} 
+                                                            className="text-xs text-slate-600 hover:text-white font-bold bg-slate-200 hover:bg-slate-800 px-2.5 py-1.5 rounded-md transition-colors shadow-sm"
+                                                            title="Mark all items in this category as Omitted from calculations"
+                                                        >Omit</button>
+                                                        <button 
+                                                            onClick={() => {
+                                                                setDialog({
+                                                                    type: 'select-autocomplete',
+                                                                    options: combinedCategories,
+                                                                    inputValue: 'General',
+                                                                    title: 'Move to Description & Re-Categorize',
+                                                                    message: `Append text "[Cat: ${stat.label}]" to the description of all ${stat.count} items, and assign them to a new category:`,
+                                                                    confirmText: 'Move & Update',
+                                                                    onConfirm: async (selectedCat) => {
+                                                                        if (!selectedCat) return;
+                                                                        setSyncing(true);
+                                                                        try {
+                                                                            const CHUNK = 400;
+                                                                            const idsToUpdate = ledger.filter(tx => (tx.cat || 'General') === stat.label);
+                                                                            const colRef = getLedgerRef();
+                                                                            for (let i = 0; i < idsToUpdate.length; i += CHUNK) {
+                                                                                const batch = db.batch();
+                                                                                idsToUpdate.slice(i, i + CHUNK).forEach(tx => {
+                                                                                    const newDesc = `${tx.desc} [Cat: ${stat.label}]`.trim();
+                                                                                    batch.set(colRef.doc(tx.id), { cat: selectedCat, desc: newDesc }, { merge: true });
+                                                                                });
+                                                                                await batch.commit();
+                                                                            }
+                                                                            showNotification('success', `Moved '${stat.label}' to desc and updated ${idsToUpdate.length} items to '${selectedCat}'.`);
+                                                                        } catch (err) {
+                                                                            showNotification('error', `Update failed: ${err.message}`);
+                                                                        }
+                                                                        setSyncing(false);
+                                                                    }
+                                                                });
+                                                            }} 
+                                                            className="text-xs text-amber-600 hover:text-white font-bold bg-amber-50 hover:bg-amber-600 px-2.5 py-1.5 rounded-md transition-colors shadow-sm"
+                                                            title="Move category text into description and assign a new main category"
+                                                        >To Desc</button>
+                                                        <button 
+                                                            onClick={() => {
+                                                                setDialog({
+                                                                    type: 'select-autocomplete',
+                                                                    options: combinedCategories,
+                                                                    title: 'Rename / Merge Category',
+                                                                    message: `Rename all ${stat.count} items in '${stat.label}' to a new category. If the name already exists, they will merge.`,
+                                                                    inputValue: stat.label,
+                                                                    confirmText: 'Rename',
+                                                                    onConfirm: async (newCat) => {
+                                                                        if (!newCat || !newCat.trim() || stat.label === newCat.trim()) return;
+                                                                        setSyncing(true);
+                                                                        try {
+                                                                            const CHUNK = 400;
+                                                                            const idsToUpdate = ledger.filter(tx => (tx.cat || 'General') === stat.label).map(tx => tx.id);
+                                                                            const colRef = getLedgerRef();
+                                                                            for (let i = 0; i < idsToUpdate.length; i += CHUNK) {
+                                                                                const batch = db.batch();
+                                                                                idsToUpdate.slice(i, i + CHUNK).forEach(id => {
+                                                                                    batch.set(colRef.doc(id), { cat: newCat.trim() }, { merge: true });
+                                                                                });
+                                                                                await batch.commit();
+                                                                            }
+                                                                            showNotification('success', `Merged '${stat.label}' into '${newCat.trim()}'.`);
+                                                                        } catch (err) {
+                                                                            showNotification('error', `Update failed: ${err.message}`);
+                                                                        }
+                                                                        setSyncing(false);
+                                                                    }
+                                                                });
+                                                            }} 
+                                                            className="text-xs text-blue-600 hover:text-white font-bold bg-blue-50 hover:bg-blue-600 px-2.5 py-1.5 rounded-md transition-colors shadow-sm"
+                                                        >Rename</button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                            {allCategoryStats.filter(s => s.label.toLowerCase().includes(managerSearch.toLowerCase())).length === 0 && (
+                                                <tr><td colSpan="3" className="p-4 text-center text-slate-400">No categories match your search.</td></tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Edit Modal */}
+                    {editId && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+                                <div className="flex justify-between items-center border-b p-5 bg-slate-50">
+                                    <h3 className="font-black uppercase tracking-widest text-slate-900 text-lg flex items-center gap-2"><i className="ph ph-pencil-simple text-blue-600"></i> Edit Record</h3>
+                                    <button onClick={() => setEditId(null)} className="text-slate-400 hover:text-slate-600 bg-slate-200 hover:bg-slate-300 p-2 rounded-md transition-colors"><i className="ph ph-x text-lg"></i></button>
+                                </div>
+                                
+                                <div className="p-6 space-y-5 overflow-y-auto max-h-[65vh]">
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <div className="space-y-1.5">
+                                            <label className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Date / Time</label>
+                                            <input className="w-full border border-slate-200 rounded-lg p-2.5 text-sm font-black focus:border-blue-500 outline-none transition-all shadow-inner" type="text" value={editForm.date || ''} onChange={e => setEditForm({...editForm, date: e.target.value})}/>
+                                        </div>
+                                        <div className="space-y-1.5">
+                                            <label className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Amount (฿)</label>
+                                            <input className="w-full border border-slate-200 rounded-lg p-2.5 text-sm font-black focus:border-blue-500 outline-none transition-all shadow-inner" type="number" step="0.01" value={editForm.amt || ''} onChange={e => setEditForm({...editForm, amt: parseCurrency(e.target.value)})}/>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="space-y-1.5">
+                                        <label className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Category</label>
+                                        <input 
+                                            list="cat-list"
+                                            className="w-full border border-slate-200 rounded-lg p-2.5 text-sm font-black focus:border-blue-500 outline-none transition-all shadow-inner bg-white" 
+                                            value={editForm.cat || ''} 
+                                            onChange={e => setEditForm({...editForm, cat: e.target.value})}
+                                            placeholder="Type or click a chip below..."
+                                        />
+                                        <div className="flex flex-wrap gap-1 mt-2 max-h-24 overflow-y-auto p-1.5 bg-slate-50 border border-slate-100 rounded-lg custom-scrollbar">
+                                            {combinedCategories.filter(c => c.toLowerCase().includes((editForm.cat||'').toLowerCase())).map(cat => (
+                                                <button key={cat} onClick={() => setEditForm({...editForm, cat})} className="px-2.5 py-1 bg-white border border-slate-200 hover:border-blue-400 hover:text-blue-600 rounded text-[10px] font-bold text-slate-500 transition-colors shadow-sm">{cat}</button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                    
+                                    <label className="flex items-center gap-2 mt-2 p-3 border border-slate-200 rounded-lg bg-slate-50 cursor-pointer hover:bg-slate-100 transition-colors shadow-sm">
+                                        <input type="checkbox" checked={editForm.omit || false} onChange={e => setEditForm({...editForm, omit: e.target.checked})} className="accent-blue-600 w-5 h-5 rounded cursor-pointer" />
+                                        <span className="text-xs font-black text-slate-600 uppercase">Omit from calculations (Transfers, Change)</span>
+                                    </label>
+
+                                    <div className="space-y-1.5">
+                                        <label className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Description</label>
+                                        <textarea className="w-full border border-slate-200 rounded-lg p-2.5 text-sm font-medium focus:border-blue-500 outline-none transition-all shadow-inner" rows={3} value={editForm.desc || ''} onChange={e => setEditForm({...editForm, desc: e.target.value})}/>
+                                    </div>
+                                    {editForm.note && (
+                                        <div className="space-y-1.5">
+                                            <label className="text-[11px] font-black text-slate-400 uppercase tracking-widest">Original Notes (CSV)</label>
+                                            <textarea className="w-full border border-slate-200 rounded-lg p-2.5 text-xs font-medium bg-slate-50 text-slate-500 focus:border-blue-500 outline-none transition-all shadow-inner" rows={2} value={editForm.note || ''} onChange={e => setEditForm({...editForm, note: e.target.value})}/>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="p-5 border-t bg-slate-50 flex gap-3">
+                                    <button onClick={() => triggerDelete([editId])} className="px-5 py-3 bg-red-100 hover:bg-red-200 text-red-700 font-black rounded-xl transition-all shadow-sm"><i className="ph ph-trash text-xl"></i></button>
+                                    <button onClick={async () => {
+                                        setSyncing(true);
+                                        try {
+                                            const updateData = {
+                                                date: editForm.date,
+                                                amt: editForm.amt,
+                                                cat: editForm.cat,
+                                                desc: editForm.desc,
+                                                note: editForm.note || '',
+                                                omit: editForm.omit || false
+                                            };
+                                            await getLedgerRef().doc(editId).set(updateData, { merge: true });
+                                            setEditId(null);
+                                            showNotification('success', "Record updated.");
+                                        } catch (e) { 
+                                            showNotification('error', `Save failed: ${e.message}`); 
+                                        }
+                                        setSyncing(false);
+                                    }} className="flex-1 bg-blue-600 text-white font-black py-3 rounded-xl shadow-lg hover:bg-blue-700 active:scale-95 transition-all uppercase tracking-widest flex justify-center items-center gap-2 text-sm">
+                                        <i className="ph ph-floppy-disk text-xl"></i> Save
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Global Confirmation / Prompt Modal */}
+                    {dialog && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[120] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                            <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md space-y-4 animate-in zoom-in-95 duration-200">
+                                <h3 className="font-black uppercase tracking-widest text-slate-900 text-base">{dialog.title}</h3>
+                                <p className="text-sm font-medium text-slate-600 leading-relaxed">{dialog.message}</p>
+                                
+                                {dialog.type === 'select-autocomplete' && (
+                                    <div className="mt-3">
+                                        <input 
+                                            autoFocus 
+                                            className="w-full border border-slate-200 rounded-lg p-2.5 text-sm font-black focus:border-blue-500 outline-none transition-all shadow-inner bg-white mb-2" 
+                                            value={dialog.inputValue || ''} 
+                                            onChange={e => setDialog({...dialog, inputValue: e.target.value})} 
+                                            placeholder="Type or click a chip below..." 
+                                        />
+                                        <div className="flex flex-wrap gap-1 max-h-32 overflow-y-auto p-1.5 bg-slate-50 border border-slate-100 rounded-lg custom-scrollbar">
+                                            {dialog.options.filter(c => c.toLowerCase().includes((dialog.inputValue||'').toLowerCase())).map(opt => (
+                                                <button key={opt} onClick={() => setDialog({...dialog, inputValue: opt})} className="px-2.5 py-1.5 bg-white border border-slate-200 hover:border-blue-400 hover:text-blue-600 rounded text-[10px] font-bold text-slate-500 transition-colors text-left shadow-sm">{opt}</button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {dialog.type === 'prompt' && (
+                                    <input 
+                                        autoFocus 
+                                        list={dialog.list}
+                                        className="w-full border border-slate-200 rounded-lg p-2.5 text-sm font-black focus:border-blue-500 outline-none transition-all mt-3 shadow-inner bg-white" 
+                                        value={dialog.inputValue || ''} 
+                                        onChange={e => setDialog({...dialog, inputValue: e.target.value})} 
+                                        placeholder="Enter value..." 
+                                    />
+                                )}
+
+                                <div className="flex gap-3 pt-4 border-t mt-4">
+                                    <button onClick={() => setDialog(null)} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 rounded-lg font-bold text-slate-600 text-sm transition-colors shadow-sm">Cancel</button>
+                                    <button 
+                                        onClick={() => { 
+                                            dialog.onConfirm(dialog.inputValue); 
+                                            setDialog(null); 
+                                        }} 
+                                        className={`flex-1 py-2.5 text-white rounded-lg font-bold shadow-md transition-all text-sm ${dialog.danger ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
+                                    >
+                                        {dialog.confirmText || 'Confirm'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+    <script src="https://loren-6q.github.io/WETNav/nav.js"></script>
+</body>
+</html>
     
     <!-- Phosphor Icons -->
     <script src="https://unpkg.com/@phosphor-icons/web"></script>
